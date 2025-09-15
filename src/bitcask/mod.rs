@@ -1,8 +1,9 @@
 use std::{
     array::TryFromSliceError,
     fmt::Display,
-    io::{Error, ErrorKind},
-    path::PathBuf,
+    fs::{self, File, OpenOptions},
+    io::{Error, ErrorKind, Write},
+    path::{Path, PathBuf},
 };
 
 use crc::{CRC_32_ISO_HDLC, Crc};
@@ -226,5 +227,83 @@ impl<'a> From<Box<bincode::ErrorKind>> for StorageError<'a> {
 impl<'a> From<std::io::Error> for StorageError<'a> {
     fn from(err: std::io::Error) -> Self {
         StorageError::Io(err)
+    }
+}
+
+pub type Offset = u64;
+pub type Size = u32;
+
+pub struct LogWriter<T>
+where
+    T: Write + AsRef<[u8]> + Default,
+{
+    offset: Offset,
+    path: PathBuf,
+    buffer: T,
+}
+
+impl<T> Drop for LogWriter<T>
+where
+    T: Write + AsRef<[u8]> + Default,
+{
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+impl<T> LogWriter<T>
+where
+    T: Write + AsRef<[u8]> + Default,
+{
+    pub fn new(path: &PathBuf) -> Result<Self, &'static str> {
+        let _ = File::create_new(path).map_err(|_| "file failed to be created")?;
+        Ok(LogWriter {
+            offset: 0,
+            path: path.clone(),
+            buffer: T::default(),
+        })
+    }
+
+    pub fn current_offset(&self) -> Offset {
+        self.offset
+    }
+
+    pub fn append(&mut self, entry: &LogEntry) -> Result<Offset, &'static str> {
+        Ok(self.append_with_size(entry)?.0)
+    }
+
+    pub fn append_with_size(&mut self, entry: &LogEntry) -> Result<(Offset, Size), &'static str> {
+        let bytes = entry.serialize().map_err(|_| "failed to serialize")?;
+        self.buffer
+            .write_all(&bytes)
+            .map_err(|_| "failed to write")?;
+        let offset = self.offset;
+        self.offset += bytes.len() as u64;
+
+        Ok((offset, bytes.len() as u32))
+    }
+
+    pub fn flush(&mut self) -> Result<(), &'static str> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|_| "failed to open file")?;
+
+        file.write_all(self.buffer.as_ref())
+            .map_err(|_| "writing to file failed")?;
+
+        self.buffer = T::default();
+        Ok(())
+    }
+
+    pub fn sync(&self) -> Result<(), &'static str> {
+        let file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|_| "failed to open file")?;
+
+        file.sync_all().map_err(|_| "failed to sync")
     }
 }
