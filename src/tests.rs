@@ -1,8 +1,10 @@
 // tests/data_structures.rs
 // These tests define the expected behavior for LogEntry and LogPointer
 
-use crate::bitcask::{LogEntry, LogPointer, StorageError};
+use crate::bitcask::{LogEntry, LogPointer, LogWriter, StorageError};
+use std::fs;
 use std::io::Cursor;
+use tempfile::TempDir;
 
 #[cfg(test)]
 mod log_entry_tests {
@@ -372,5 +374,182 @@ mod error_handling_tests {
         let error = StorageError::corruption("CRC mismatch at offset 1024");
         assert!(error.to_string().contains("CRC"));
         assert!(error.to_string().contains("1024"));
+    }
+}
+
+// tests/log_writer_detailed.rs
+// Comprehensive tests for LogWriter implementation
+
+#[cfg(test)]
+mod basic_writer_tests {
+    use super::*;
+
+    #[test]
+    fn test_writer_creates_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // File shouldn't exist yet
+        assert!(!log_path.exists());
+
+        // Creating writer should create the file
+        let writer = LogWriter::<Vec<u8>>::new(&log_path).expect("Should create writer");
+
+        // File should now exist
+        assert!(log_path.exists());
+
+        // File should be empty initially
+        let metadata = fs::metadata(&log_path).unwrap();
+        assert_eq!(metadata.len(), 0);
+
+        // Writer should track position
+        assert_eq!(writer.current_offset(), 0);
+    }
+
+    #[test]
+    fn test_writer_append_updates_offset() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+        // Create a small entry
+        let mut entry = LogEntry::new(b"k", b"v", 1699564800);
+        entry.calculate_crc();
+
+        // Track offset before append
+        let offset_before = writer.current_offset();
+        assert_eq!(offset_before, 0);
+
+        // Append should return the offset where it was written
+        let write_offset = writer.append(&entry).unwrap();
+        assert_eq!(write_offset, offset_before);
+
+        // Offset should advance by size of serialized entry
+        let serialized_size = entry.serialize().unwrap().len() as u64;
+        assert_eq!(writer.current_offset(), serialized_size);
+
+        // Append another entry
+        let write_offset_2 = writer.append(&entry).unwrap();
+        assert_eq!(write_offset_2, serialized_size);
+        assert_eq!(writer.current_offset(), serialized_size * 2);
+    }
+
+    #[test]
+    fn test_writer_returns_correct_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+        // Test with various sized entries
+        let test_cases = vec![
+            (b"k".to_vec(), b"v".to_vec()),
+            (b"medium_key".to_vec(), b"medium_value".to_vec()),
+            (vec![0u8; 100], vec![0u8; 1000]), // Larger entry
+        ];
+
+        for (key, value) in test_cases {
+            let mut entry = LogEntry::new(&key, &value, 1699564800);
+            entry.calculate_crc();
+
+            let expected_size = entry.serialize().unwrap().len() as u32;
+
+            // append_with_size should return both offset and actual size
+            let (offset, size) = writer.append_with_size(&entry).unwrap();
+
+            assert_eq!(
+                size,
+                expected_size,
+                "Size should match serialized size for key len {}",
+                key.len()
+            );
+
+            // Offset should be previous position
+            assert_eq!(offset, writer.current_offset() - size as u64);
+        }
+    }
+}
+
+#[cfg(test)]
+mod buffering_tests {
+    use super::*;
+
+    #[test]
+    fn test_writer_uses_buffering() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+        // Write a small entry
+        let mut entry = LogEntry::new(b"key", b"value", 1699564800);
+        entry.calculate_crc();
+        let serialized_size = entry.serialize().unwrap().len();
+
+        writer.append(&entry).unwrap();
+
+        // Without flush, file size might be 0 due to buffering
+        // This is expected and good for performance
+        let metadata = fs::metadata(&log_path).unwrap();
+
+        // File size could be 0 (buffered) or serialized_size (unbuffered)
+        // Both are acceptable, but we need to handle both cases
+
+        // After flush, data must be in file
+        writer.flush().unwrap();
+
+        let metadata_after_flush = fs::metadata(&log_path).unwrap();
+        assert_eq!(
+            metadata_after_flush.len(),
+            serialized_size as u64,
+            "After flush, file should contain all written data"
+        );
+    }
+
+    #[test]
+    fn test_writer_flush_vs_sync() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+        let mut entry = LogEntry::new(b"test", b"data", 1699564800);
+        entry.calculate_crc();
+
+        writer.append(&entry).unwrap();
+
+        // flush() empties buffer to OS (might still be in OS cache)
+        writer.flush().unwrap();
+
+        // sync() ensures data is on disk (survives power failure)
+        writer.sync().unwrap();
+
+        // Both should complete without error
+        // sync() is stronger guarantee than flush()
+    }
+
+    #[test]
+    fn test_writer_auto_flush_on_drop() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let mut entry = LogEntry::new(b"key", b"value", 1699564800);
+        entry.calculate_crc();
+        let expected_size = entry.serialize().unwrap().len();
+
+        {
+            let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+            writer.append(&entry).unwrap();
+            // Writer dropped here - should auto-flush
+        }
+
+        // After drop, data should be in file
+        let metadata = fs::metadata(&log_path).unwrap();
+        assert_eq!(
+            metadata.len(),
+            expected_size as u64,
+            "Drop should flush buffered data"
+        );
     }
 }
