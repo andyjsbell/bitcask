@@ -1,0 +1,230 @@
+use std::{
+    array::TryFromSliceError,
+    fmt::Display,
+    io::{Error, ErrorKind},
+    path::PathBuf,
+};
+
+use crc::{CRC_32_ISO_HDLC, Crc};
+type CRC = u32;
+type FileID = u32;
+
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "bincode")]
+pub const HEADER_SIZE: usize = 4 + 8 + 4 + 4 + 8 + 8;
+#[cfg(not(feature = "bincode"))]
+pub const HEADER_SIZE: usize = 20;
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct LogPointer {
+    file_id: FileID,
+    offset: u64,
+    size: u32,
+    timestamp: u64,
+}
+
+impl LogPointer {
+    pub fn new(file_id: FileID, offset: u64, size: u32, timestamp: u64) -> Self {
+        LogPointer {
+            file_id,
+            offset,
+            size,
+            timestamp,
+        }
+    }
+
+    pub fn file_id(&self) -> FileID {
+        self.file_id
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+    pub fn file_path(&self, path: &str) -> PathBuf {
+        let mut path_buf = PathBuf::new();
+        path_buf.push(path);
+        path_buf.push(format!("{:06}.log", self.file_id));
+        path_buf
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct LogEntryHeader {
+    crc: CRC,
+    timestamp: u64,
+    key_len: u32,
+    value_len: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LogEntry {
+    header: LogEntryHeader,
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl LogEntry {
+    pub fn new(key: &[u8], value: &[u8], timestamp: u64) -> Self {
+        LogEntry {
+            header: LogEntryHeader {
+                key_len: key.len() as u32,
+                value_len: value.len() as u32,
+                timestamp,
+                crc: 0,
+            },
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    pub fn timestamp(&self) -> u64 {
+        self.header.timestamp
+    }
+
+    pub fn key_len(&self) -> u32 {
+        self.header.key_len
+    }
+
+    pub fn value_len(&self) -> u32 {
+        self.header.value_len
+    }
+
+    pub fn calculate_crc(&mut self) {
+        let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+        let bytes = [self.key(), self.value(), &self.timestamp().to_le_bytes()].concat();
+        let checksum = crc.checksum(&bytes);
+        self.header.crc = checksum;
+    }
+
+    pub fn crc(&self) -> CRC {
+        self.header.crc
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, StorageError> {
+        #[cfg(feature = "bincode")]
+        {
+            Ok(bincode::serialize(&self)?)
+        }
+        #[cfg(not(feature = "bincode"))]
+        {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&self.crc().to_le_bytes());
+            bytes.extend_from_slice(&self.key_len().to_le_bytes());
+            bytes.extend_from_slice(&self.value_len().to_le_bytes());
+            bytes.extend_from_slice(&self.timestamp().to_le_bytes());
+            bytes.extend_from_slice(self.key());
+            bytes.extend_from_slice(self.value());
+            Ok(bytes)
+        }
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, StorageError> {
+        if bytes.len() < 20 {
+            return Err(StorageError::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "header is 20 bytes",
+            )));
+        }
+        #[cfg(feature = "bincode")]
+        {
+            Ok(bincode::deserialize(bytes)?)
+        }
+        #[cfg(not(feature = "bincode"))]
+        {
+            let crc = u32::from_le_bytes(bytes[0..4].try_into()?);
+            let key_len = u32::from_le_bytes(bytes[4..8].try_into()?);
+            let value_len = u32::from_le_bytes(bytes[8..12].try_into()?);
+            let timestamp = u64::from_le_bytes(bytes[12..20].try_into()?);
+            let key = bytes[20..20 + key_len as usize].to_vec();
+            let value = bytes[(20 + key_len as usize)..].to_vec();
+            Ok(LogEntry {
+                header: LogEntryHeader {
+                    crc,
+                    timestamp,
+                    key_len,
+                    value_len,
+                },
+                key,
+                value,
+            })
+        }
+    }
+
+    pub fn validate_crc(&self) -> bool {
+        let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+        let bytes = [self.key(), self.value(), &self.timestamp().to_le_bytes()].concat();
+        let checksum = crc.checksum(&bytes);
+        checksum == self.crc()
+    }
+}
+
+#[derive(Debug)]
+pub enum StorageError<'a> {
+    Io(std::io::Error),
+    Corruption(&'a str),
+    Serialization(&'a str),
+}
+
+impl<'a> Display for StorageError<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "IO Error: {}", e),
+            Self::Corruption(e) => write!(f, "Corruption: {}", e),
+            Self::Serialization(e) => write!(f, "Serialization: {}", e),
+        }
+    }
+}
+
+impl<'a> std::error::Error for StorageError<'a> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> StorageError<'a> {
+    pub fn corruption(e: &'a str) -> StorageError<'a> {
+        StorageError::Corruption(e)
+    }
+    pub fn serialization(e: &'a str) -> StorageError<'a> {
+        StorageError::Serialization(e)
+    }
+}
+
+impl<'a> From<TryFromSliceError> for StorageError<'a> {
+    fn from(_: TryFromSliceError) -> Self {
+        Self::Serialization("slice error")
+    }
+}
+
+#[cfg(feature = "bincode")]
+impl<'a> From<Box<bincode::ErrorKind>> for StorageError<'a> {
+    fn from(_: Box<bincode::ErrorKind>) -> Self {
+        StorageError::Serialization("serialization error")
+    }
+}
+
+impl<'a> From<std::io::Error> for StorageError<'a> {
+    fn from(err: std::io::Error) -> Self {
+        StorageError::Io(err)
+    }
+}
