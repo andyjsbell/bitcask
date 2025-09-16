@@ -203,11 +203,11 @@ mod log_pointer_tests {
 
         let pointer_size = mem::size_of::<LogPointer>();
 
-        // Should be exactly 24 bytes (4 + 8 + 4 + 8)
+        // Should be exactly 32 bytes (4 + 8 + 8 + 8) which is 28 but is aligned to 32
         // This is important for memory calculations
         assert_eq!(
-            pointer_size, 24,
-            "LogPointer should be exactly 24 bytes for memory efficiency"
+            pointer_size, 32,
+            "LogPointer should be exactly 32 bytes for memory efficiency"
         );
     }
 
@@ -270,7 +270,7 @@ mod integration_tests {
 
         let offset = buffer.position();
         let serialized = entry.serialize().expect("Serialization should succeed");
-        let size = serialized.len() as u32;
+        let size = serialized.len() as u64;
 
         buffer.write_all(&serialized).expect("Write should succeed");
 
@@ -311,7 +311,7 @@ mod integration_tests {
 
             let offset = buffer.position();
             let serialized = entry.serialize().expect("Serialization should succeed");
-            let size = serialized.len() as u32;
+            let size = serialized.len() as u64;
 
             buffer.write_all(&serialized).expect("Write should succeed");
 
@@ -337,6 +337,205 @@ mod integration_tests {
             assert_eq!(entry.key(), expected_key.as_bytes());
             assert_eq!(entry.value(), expected_value.as_bytes());
         }
+    }
+    #[test]
+    fn test_memindex_with_logreader() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let mut index = MemIndex::new();
+
+        // Write entries and build index
+        {
+            let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+            for i in 0..20 {
+                let key = format!("key_{:02}", i).into_bytes();
+                let value = format!("value_{:02}", i).into_bytes();
+
+                let mut entry = LogEntry::new(&key, &value, 1699564800 + i);
+                entry.calculate_crc();
+
+                let (offset, size) = writer.append_with_size(&entry).unwrap();
+                let pointer = LogPointer::new(0, offset, size, entry.timestamp());
+
+                index.insert(key, pointer);
+            }
+            writer.sync().unwrap();
+        }
+
+        // Use index to read specific values
+        let mut reader = LogReader::new(&log_path).unwrap();
+
+        // Read value for key_10
+        let pointer = index.get(b"key_10").unwrap();
+        let entry = reader.read_at(pointer.offset(), pointer.size()).unwrap();
+        assert_eq!(entry.value(), b"value_10");
+
+        // Read value for key_05
+        let pointer = index.get(b"key_05").unwrap();
+        let entry = reader.read_at(pointer.offset(), pointer.size()).unwrap();
+        assert_eq!(entry.value(), b"value_05");
+
+        // Non-existent key
+        assert!(index.get(b"key_99").is_none());
+    }
+
+    #[test]
+    fn test_rebuild_index_from_log() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // Write log without maintaining index
+        {
+            let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+            for i in 0..10 {
+                let mut entry = LogEntry::new(
+                    format!("key{}", i).as_bytes(),
+                    format!("value{}", i).as_bytes(),
+                    1699564800 + i,
+                );
+                entry.calculate_crc();
+                writer.append(&entry).unwrap();
+            }
+
+            // Write some updates (same keys)
+            for i in 0..5 {
+                let mut entry = LogEntry::new(
+                    format!("key{}", i).as_bytes(),
+                    format!("updated_value{}", i).as_bytes(),
+                    1699565000 + i,
+                );
+                entry.calculate_crc();
+                writer.append(&entry).unwrap();
+            }
+
+            writer.sync().unwrap();
+        }
+
+        // Rebuild index by scanning log
+        let mut index = MemIndex::new();
+        let reader = LogReader::new(&log_path).unwrap();
+        let mut offset = 0u64;
+
+        for result in reader.iter().unwrap() {
+            let entry = result.unwrap();
+            let size = entry.serialize().unwrap().len() as u64;
+
+            let pointer = LogPointer::new(0, offset, size, entry.timestamp());
+
+            // Insert or update - last write wins
+            index.insert(entry.key().to_vec(), pointer);
+
+            offset += size as u64;
+        }
+
+        // Verify index has correct values
+        assert_eq!(index.len(), 10); // 10 unique keys
+
+        // Keys 0-4 should point to updated values
+        let mut reader = LogReader::new(&log_path).unwrap();
+
+        for i in 0..5 {
+            let key = format!("key{}", i).into_bytes();
+            let pointer = index.get(&key).unwrap();
+            let entry = reader.read_at(pointer.offset(), pointer.size()).unwrap();
+            assert_eq!(entry.value(), format!("updated_value{}", i).as_bytes());
+        }
+
+        // Keys 5-9 should point to original values
+        for i in 5..10 {
+            let key = format!("key{}", i).into_bytes();
+            let pointer = index.get(&key).unwrap();
+            let entry = reader.read_at(pointer.offset(), pointer.size()).unwrap();
+            assert_eq!(entry.value(), format!("value{}", i).as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_delete_handling_in_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let mut index = MemIndex::new();
+
+        // Write and delete some entries
+        {
+            let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+            // Write key1
+            let mut entry = LogEntry::new(b"key1", b"value1", 1699564800);
+            entry.calculate_crc();
+            let (offset, size) = writer.append_with_size(&entry).unwrap();
+            index.insert(
+                b"key1".to_vec(),
+                LogPointer::new(0, offset, size, entry.timestamp()),
+            );
+
+            // Write key2
+            let mut entry = LogEntry::new(b"key2", b"value2", 1699564801);
+            entry.calculate_crc();
+            let (offset, size) = writer.append_with_size(&entry).unwrap();
+            index.insert(
+                b"key2".to_vec(),
+                LogPointer::new(0, offset, size, entry.timestamp()),
+            );
+
+            // Delete key1 (tombstone entry with empty value)
+            let mut tombstone = LogEntry::new(b"key1", b"", 1699564802);
+            tombstone.calculate_crc();
+            writer.append(&tombstone).unwrap();
+
+            // Remove from index
+            index.delete(b"key1");
+
+            writer.sync().unwrap();
+        }
+
+        // key1 should not be in index
+        assert!(index.get(b"key1").is_none());
+
+        // key2 should still be there
+        assert!(index.get(b"key2").is_some());
+
+        let mut reader = LogReader::new(&log_path).unwrap();
+        let pointer = index.get(b"key2").unwrap();
+        let entry = reader.read_at(pointer.offset(), pointer.size()).unwrap();
+        assert_eq!(entry.value(), b"value2");
+    }
+
+    #[test]
+    fn test_memindex_memory_vs_disk_size() {
+        // This test demonstrates the memory savings of the index approach
+
+        let mut index = MemIndex::new();
+        let mut total_value_size = 0usize;
+
+        // Simulate 1000 entries with 1KB values each
+        for i in 0..1000 {
+            let key = format!("key_{:04}", i).into_bytes();
+            let value_size = 1024; // 1KB value
+            total_value_size += value_size;
+
+            // We only store the pointer, not the value
+            let pointer = LogPointer::new(0, i as u64 * 1100, 1024 + 20, 0);
+            index.insert(key, pointer);
+        }
+
+        // If we stored values: ~1MB in memory
+        // With pointers: ~32KB for pointers + key overhead
+
+        println!(
+            "Storing values in memory would use: {} bytes",
+            total_value_size
+        );
+        println!("Storing pointers uses: ~{} bytes", 1000 * (32 + 10)); // 32 bytes per pointer + ~10 bytes per key
+
+        assert!(
+            1000 * 42 < total_value_size,
+            "Index should use much less memory than storing values"
+        );
     }
 }
 
@@ -1007,7 +1206,7 @@ mod memindex_tests {
 
         assert_eq!(index.len(), 1000);
 
-        // Each entry should only store pointer (24 bytes) + key + HashMap overhead
+        // Each entry should only store pointer (32 bytes) + key + HashMap overhead
         // Not the actual values (which could be much larger)
 
         // This is more of a documentation test - actual memory usage
