@@ -1,8 +1,13 @@
 use std::{
     array::TryFromSliceError,
+    collections::{
+        HashMap,
+        hash_map::{Iter, Keys},
+    },
     fmt::Display,
     fs::OpenOptions,
     io::{Error, ErrorKind, Write},
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
 };
 
@@ -16,6 +21,50 @@ use serde::{Deserialize, Serialize};
 pub const HEADER_SIZE: usize = 4 + 8 + 4 + 4 + 8 + 8;
 #[cfg(not(feature = "bincode"))]
 pub const HEADER_SIZE: usize = 20;
+
+pub struct MemIndex {
+    index: HashMap<Vec<u8>, LogPointer>,
+}
+
+impl MemIndex {
+    pub fn new() -> Self {
+        MemIndex {
+            index: HashMap::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn insert(&mut self, key: Vec<u8>, pointer: LogPointer) -> Option<LogPointer> {
+        self.index.insert(key, pointer)
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<&LogPointer> {
+        self.index.get(key)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub fn delete(&mut self, key: &[u8]) -> Option<LogPointer> {
+        self.index.remove(key)
+    }
+
+    pub fn clear(&mut self) {
+        self.index.clear();
+    }
+
+    pub fn keys(&self) -> Keys<'_, Vec<u8>, LogPointer> {
+        self.index.keys()
+    }
+
+    pub fn iter(&self) -> Iter<'_, Vec<u8>, LogPointer> {
+        self.index.iter()
+    }
+}
 
 fn log_file_path(file_id: FileID) -> String {
     format!("{file_id:06}.log")

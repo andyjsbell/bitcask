@@ -1,7 +1,5 @@
-// tests/data_structures.rs
-// These tests define the expected behavior for LogEntry and LogPointer
-
-use crate::bitcask::{LogEntry, LogPointer, LogWriter, StorageError};
+use crate::bitcask::{LogEntry, LogPointer, LogWriter, MemIndex, StorageError};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use tempfile::TempDir;
@@ -901,5 +899,186 @@ mod concurrent_writer_tests {
 
         // Should have written all 40 entries
         writer.lock().unwrap().sync().unwrap();
+    }
+}
+
+// ============================================
+// MemIndex Tests
+// ============================================
+
+#[cfg(test)]
+mod memindex_tests {
+    use super::*;
+
+    #[test]
+    fn test_memindex_new() {
+        let index = MemIndex::new();
+
+        // Should start empty
+        assert_eq!(index.len(), 0);
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_memindex_insert_and_get() {
+        let mut index = MemIndex::new();
+
+        let pointer = LogPointer::new(0, 100, 50, 1699564800);
+
+        // Insert returns old value if key existed
+        let old = index.insert(b"key1".to_vec(), pointer);
+        assert!(old.is_none(), "First insert should return None");
+
+        // Get should return reference to pointer
+        let retrieved = index.get(b"key1");
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap(), &pointer);
+
+        // Non-existent key returns None
+        assert!(index.get(b"key2").is_none());
+    }
+
+    #[test]
+    fn test_memindex_update_existing() {
+        let mut index = MemIndex::new();
+
+        let pointer1 = LogPointer::new(0, 100, 50, 1699564800);
+        let pointer2 = LogPointer::new(1, 200, 60, 1699564900);
+
+        // First insert
+        index.insert(b"key".to_vec(), pointer1);
+
+        // Update with new pointer
+        let old = index.insert(b"key".to_vec(), pointer2);
+        assert!(old.is_some());
+        assert_eq!(old.unwrap(), pointer1, "Should return old pointer");
+
+        // Should now have new pointer
+        assert_eq!(index.get(b"key").unwrap(), &pointer2);
+
+        // Still only one entry
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn test_memindex_delete() {
+        let mut index = MemIndex::new();
+
+        let pointer = LogPointer::new(0, 100, 50, 1699564800);
+        index.insert(b"key".to_vec(), pointer);
+
+        // Delete should return the removed pointer
+        let removed = index.delete(b"key");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap(), pointer);
+
+        // Key should no longer exist
+        assert!(index.get(b"key").is_none());
+        assert_eq!(index.len(), 0);
+
+        // Deleting non-existent key returns None
+        assert!(index.delete(b"key").is_none());
+    }
+
+    #[test]
+    fn test_memindex_binary_keys() {
+        let mut index = MemIndex::new();
+
+        // Should handle arbitrary binary keys
+        let binary_key = vec![0x00, 0xFF, 0xDE, 0xAD, 0xBE, 0xEF];
+        let pointer = LogPointer::new(0, 0, 10, 0);
+
+        index.insert(binary_key.clone(), pointer);
+        assert!(index.get(&binary_key).is_some());
+    }
+
+    #[test]
+    fn test_memindex_memory_efficiency() {
+        use std::mem;
+
+        let mut index = MemIndex::new();
+
+        // Add many entries
+        for i in 0..1000 {
+            let key = format!("key_{:04}", i).into_bytes();
+            let pointer = LogPointer::new(0, i * 100, 100, 1699564800);
+            index.insert(key, pointer);
+        }
+
+        assert_eq!(index.len(), 1000);
+
+        // Each entry should only store pointer (24 bytes) + key + HashMap overhead
+        // Not the actual values (which could be much larger)
+
+        // This is more of a documentation test - actual memory usage
+        // depends on HashMap implementation
+        println!("MemIndex with 1000 entries size estimate");
+        println!(
+            "Per entry: ~{} bytes (key + LogPointer + overhead)",
+            mem::size_of::<Vec<u8>>() + mem::size_of::<LogPointer>()
+        );
+    }
+
+    #[test]
+    fn test_memindex_clear() {
+        let mut index = MemIndex::new();
+
+        for i in 0..10 {
+            let key = format!("key_{}", i).into_bytes();
+            let pointer = LogPointer::new(0, i * 100, 50, 0);
+            index.insert(key, pointer);
+        }
+
+        assert_eq!(index.len(), 10);
+
+        index.clear();
+
+        assert_eq!(index.len(), 0);
+        assert!(index.is_empty());
+
+        // All keys should be gone
+        assert!(index.get(b"key_0").is_none());
+    }
+
+    #[test]
+    fn test_memindex_iteration() {
+        let mut index = MemIndex::new();
+
+        let mut expected = HashMap::new();
+        for i in 0..5 {
+            let key = format!("key_{}", i).into_bytes();
+            let pointer = LogPointer::new(0, i * 100, 50, 1699564800 + i);
+            index.insert(key.clone(), pointer);
+            expected.insert(key, pointer);
+        }
+
+        // Should be able to iterate over all entries
+        let mut count = 0;
+        for (key, pointer) in index.iter() {
+            count += 1;
+            assert_eq!(expected.get(key), Some(pointer));
+        }
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_memindex_keys() {
+        let mut index = MemIndex::new();
+
+        let keys: Vec<Vec<u8>> = vec![b"apple".to_vec(), b"banana".to_vec(), b"cherry".to_vec()];
+
+        for (i, key) in keys.iter().enumerate() {
+            let pointer = LogPointer::new(0, i as u64 * 100, 50, 0);
+            index.insert(key.clone(), pointer);
+        }
+
+        // Collect all keys
+        let mut index_keys: Vec<Vec<u8>> = index.keys().cloned().collect();
+        index_keys.sort();
+
+        let mut expected_keys = keys.clone();
+        expected_keys.sort();
+
+        assert_eq!(index_keys, expected_keys);
     }
 }
