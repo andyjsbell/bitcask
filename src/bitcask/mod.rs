@@ -239,15 +239,30 @@ impl<'a> From<std::io::Error> for StorageError<'a> {
 }
 
 pub type Offset = u64;
-pub type Size = u32;
+pub type Size = u64;
+const DEFAULT_FILE_SIZE: Size = 1024 * 1024;
+
+struct RotationConfig {
+    base_dir: PathBuf,
+    max_file_size: Size,
+    current_file_id: FileID,
+}
+
+impl RotationConfig {
+    pub fn increment_file_id(&mut self) -> FileID {
+        self.current_file_id += 1;
+        self.current_file_id
+    }
+}
 
 pub struct LogWriter<T>
 where
     T: Write + AsRef<[u8]> + Default,
 {
     offset: Offset,
-    path: PathBuf,
+    current_file: PathBuf,
     buffer: T,
+    rotation_config: Option<RotationConfig>,
 }
 
 impl<T> Drop for LogWriter<T>
@@ -263,17 +278,86 @@ impl<T> LogWriter<T>
 where
     T: Write + AsRef<[u8]> + Default,
 {
-    pub fn new(path: &PathBuf) -> Result<Self, &'static str> {
-        let _ = File::create_new(path).map_err(|_| "file failed to be created")?;
+    pub fn new(path: &Path) -> Result<Self, &'static str> {
+        Self::init(path, None)
+    }
+
+    pub fn with_options(path: &Path, size: Size) -> Result<Self, &'static str> {
+        let current_file_id = 0;
+        Self::init(
+            &path.join(log_file_path(current_file_id)),
+            Some(RotationConfig {
+                max_file_size: size,
+                current_file_id,
+                base_dir: path.into(),
+            }),
+        )
+    }
+
+    fn init(
+        current_file: &Path,
+        rotation_config: Option<RotationConfig>,
+    ) -> Result<Self, &'static str> {
         Ok(LogWriter {
             offset: 0,
-            path: path.clone(),
+            current_file: current_file.to_path_buf(),
             buffer: T::default(),
+            rotation_config,
         })
+    }
+
+    pub fn current_file_id(&self) -> FileID {
+        match &self.rotation_config {
+            Some(config) => config.current_file_id,
+            None => 0,
+        }
     }
 
     pub fn current_offset(&self) -> Offset {
         self.offset
+    }
+
+    fn reset_buffer(&mut self) {
+        self.buffer = T::default();
+        self.offset = 0;
+    }
+
+    fn write_to_buffer(&mut self, bytes: &[u8]) -> Result<u64, &'static str> {
+        self.buffer
+            .write_all(&bytes)
+            .map_err(|_| "failed to write")?;
+
+        let offset = self.offset;
+        self.offset += bytes.len() as Size;
+        Ok(offset)
+    }
+
+    pub fn should_rotate(&self, entry: &LogEntry) -> bool {
+        match &self.rotation_config {
+            Some(rotation_config) => {
+                let entry_size = entry.size() as u64;
+                self.current_offset() + entry_size > rotation_config.max_file_size
+            }
+            None => false,
+        }
+    }
+
+    pub fn rotate(&mut self) -> Result<(), &'static str> {
+        if self.rotation_config.is_none() {
+            return Err("No rotation config available");
+        }
+
+        self.flush()?;
+
+        let rotation_config = self.rotation_config.as_mut().unwrap();
+        let new_file_id = rotation_config.increment_file_id();
+
+        let mut new_file_path = rotation_config.base_dir.clone();
+        new_file_path.push(log_file_path(new_file_id));
+
+        self.current_file = new_file_path;
+
+        Ok(())
     }
 
     pub fn append(&mut self, entry: &LogEntry) -> Result<Offset, &'static str> {
@@ -281,36 +365,34 @@ where
     }
 
     pub fn append_with_size(&mut self, entry: &LogEntry) -> Result<(Offset, Size), &'static str> {
+        if self.should_rotate(entry) {
+            self.rotate()?;
+        }
         let bytes = entry.serialize().map_err(|_| "failed to serialize")?;
-        self.buffer
-            .write_all(&bytes)
-            .map_err(|_| "failed to write")?;
-        let offset = self.offset;
-        self.offset += bytes.len() as u64;
+        let offset = self.write_to_buffer(&bytes)?;
+        Ok((offset, bytes.len() as Size))
+    }
 
-        Ok((offset, bytes.len() as u32))
+    fn get_current_file(&self) -> Result<std::fs::File, &'static str> {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.current_file)
+            .map_err(|_| "failed to open file")
     }
 
     pub fn flush(&mut self) -> Result<(), &'static str> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|_| "failed to open file")?;
+        let mut file = self.get_current_file()?;
 
         file.write_all(self.buffer.as_ref())
             .map_err(|_| "writing to file failed")?;
 
-        self.buffer = T::default();
+        self.reset_buffer();
         Ok(())
     }
 
     pub fn sync(&self) -> Result<(), &'static str> {
-        let file = OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|_| "failed to open file")?;
+        let file = self.get_current_file()?;
 
         file.sync_all().map_err(|_| "failed to sync")
     }
