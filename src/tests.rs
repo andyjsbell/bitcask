@@ -760,3 +760,88 @@ mod file_error_handling_tests {
         let _ = writer.append(&entry);
     }
 }
+
+#[cfg(test)]
+mod performance_characteristics {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn test_append_performance() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("perf.log");
+
+        let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+        // Prepare test entry (1KB)
+        let value = vec![0xAB; 1000];
+        let mut entry = LogEntry::new(b"key", &value, 1699564800);
+        entry.calculate_crc();
+
+        // Warm up
+        for _ in 0..100 {
+            writer.append(&entry).unwrap();
+        }
+
+        // Measure append performance
+        let iterations = 1000;
+        let start = Instant::now();
+
+        for _ in 0..iterations {
+            writer.append(&entry).unwrap();
+        }
+
+        let elapsed = start.elapsed();
+        let ops_per_sec = iterations as f64 / elapsed.as_secs_f64();
+
+        println!("Append performance: {:.0} ops/sec", ops_per_sec);
+
+        // Should achieve at least 10,000 ops/sec for 1KB entries
+        assert!(
+            ops_per_sec > 10_000.0,
+            "Append performance too low: {:.0} ops/sec",
+            ops_per_sec
+        );
+    }
+
+    #[test]
+    fn test_buffering_impact() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Test with explicit flushes (simulates unbuffered)
+        let log_path_unbuffered = temp_dir.path().join("unbuffered.log");
+        let mut writer_unbuffered = LogWriter::<Vec<u8>>::new(&log_path_unbuffered).unwrap();
+
+        let mut entry = LogEntry::new(b"k", b"v", 1699564800);
+        entry.calculate_crc();
+
+        let start = Instant::now();
+        for _ in 0..1000 {
+            writer_unbuffered.append(&entry).unwrap();
+            writer_unbuffered.flush().unwrap(); // Force flush each time
+        }
+        let unbuffered_time = start.elapsed();
+
+        // Test with buffering (no explicit flushes)
+        let log_path_buffered = temp_dir.path().join("buffered.log");
+        let mut writer_buffered = LogWriter::<Vec<u8>>::new(&log_path_buffered).unwrap();
+
+        let start = Instant::now();
+        for _ in 0..1000 {
+            writer_buffered.append(&entry).unwrap();
+            // No flush - let buffering work
+        }
+        writer_buffered.flush().unwrap(); // Single flush at end
+        let buffered_time = start.elapsed();
+
+        // Buffered should be significantly faster
+        let speedup = unbuffered_time.as_secs_f64() / buffered_time.as_secs_f64();
+        println!("Buffering speedup: {:.1}x", speedup);
+
+        assert!(
+            speedup > 2.0,
+            "Buffering should provide significant speedup, got {:.1}x",
+            speedup
+        );
+    }
+}
