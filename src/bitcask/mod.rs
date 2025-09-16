@@ -1,7 +1,7 @@
 use std::{
     array::TryFromSliceError,
     fmt::Display,
-    fs::{self, File, OpenOptions},
+    fs::OpenOptions,
     io::{Error, ErrorKind, Write},
     path::{Path, PathBuf},
 };
