@@ -1,4 +1,4 @@
-use crate::bitcask::{LogEntry, LogPointer, LogWriter, MemIndex, StorageError};
+use crate::bitcask::{LogEntry, LogPointer, LogReader, LogWriter, MemIndex, StorageError};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
@@ -1080,5 +1080,257 @@ mod memindex_tests {
         expected_keys.sort();
 
         assert_eq!(index_keys, expected_keys);
+    }
+}
+
+// ============================================
+// LogReader Tests
+// ============================================
+
+#[cfg(test)]
+mod logreader_tests {
+    use super::*;
+
+    #[test]
+    fn test_reader_open_existing_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // Create file with writer
+        {
+            let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+            let mut entry = LogEntry::new(b"test", b"data", 1699564800);
+            entry.calculate_crc();
+            writer.append(&entry).unwrap();
+            writer.sync().unwrap();
+        }
+
+        // Should be able to open for reading
+        let reader = LogReader::new(&log_path);
+        assert!(reader.is_ok());
+    }
+
+    #[test]
+    fn test_reader_open_nonexistent_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("nonexistent.log");
+
+        // Should fail gracefully
+        let reader = LogReader::new(&log_path);
+        assert!(reader.is_err());
+        assert!(matches!(reader.unwrap_err(), StorageError::Io(_)));
+    }
+
+    #[test]
+    fn test_reader_read_at_specific_offset() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // Write some entries
+        let mut pointers = Vec::new();
+        {
+            let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+            for i in 0..3 {
+                let mut entry = LogEntry::new(
+                    format!("key{}", i).as_bytes(),
+                    format!("value{}", i).as_bytes(),
+                    1699564800 + i,
+                );
+                entry.calculate_crc();
+
+                let (offset, size) = writer.append_with_size(&entry).unwrap();
+                pointers.push((offset, size));
+            }
+            writer.sync().unwrap();
+        }
+
+        // Read middle entry
+        let mut reader = LogReader::new(&log_path).unwrap();
+        let (offset, size) = pointers[1];
+
+        let entry = reader.read_at(offset, size).unwrap();
+        assert_eq!(entry.key(), b"key1");
+        assert_eq!(entry.value(), b"value1");
+        assert!(entry.validate_crc());
+    }
+
+    #[test]
+    fn test_reader_read_beyond_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // Write small file
+        {
+            let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+            let mut entry = LogEntry::new(b"key", b"value", 1699564800);
+            entry.calculate_crc();
+            writer.append(&entry).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let mut reader = LogReader::new(&log_path).unwrap();
+
+        // Try to read beyond file
+        let result = reader.read_at(10000, 100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reader_corrupted_crc() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // Write entry then corrupt it
+        let mut entry = LogEntry::new(b"key", b"value", 1699564800);
+        entry.calculate_crc();
+        let mut serialized = entry.serialize().unwrap();
+
+        // Corrupt data after CRC field
+        serialized[20] ^= 0xFF;
+        let size = serialized.len() as u64;
+        fs::write(&log_path, serialized).unwrap();
+
+        // Read should succeed but CRC validation should fail
+        let mut reader = LogReader::new(&log_path).unwrap();
+        let read_entry = reader.read_at(0, size).unwrap();
+
+        assert!(!read_entry.validate_crc(), "Should detect corruption");
+    }
+
+    #[test]
+    fn test_reader_iterator_full_scan() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // Write multiple entries
+        let mut expected = Vec::new();
+        {
+            let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+            for i in 0..10 {
+                let mut entry = LogEntry::new(
+                    format!("key{}", i).as_bytes(),
+                    format!("value{}", i).as_bytes(),
+                    1699564800 + i,
+                );
+                entry.calculate_crc();
+
+                expected.push((entry.key().to_vec(), entry.value().to_vec()));
+                writer.append(&entry).unwrap();
+            }
+            writer.sync().unwrap();
+        }
+
+        // Iterate through all entries
+        let reader = LogReader::new(&log_path).unwrap();
+        let mut count = 0;
+
+        for (i, result) in reader.iter().unwrap().enumerate() {
+            let entry = result.unwrap();
+            assert!(entry.validate_crc());
+            assert_eq!(entry.key(), expected[i].0);
+            assert_eq!(entry.value(), expected[i].1);
+            count += 1;
+        }
+
+        assert_eq!(count, 10, "Should read all entries");
+    }
+
+    #[test]
+    fn test_reader_iterator_partial_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // Write complete entry
+        {
+            let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+            let mut entry = LogEntry::new(b"complete", b"entry", 1699564800);
+            entry.calculate_crc();
+            writer.append(&entry).unwrap();
+            writer.sync().unwrap();
+        }
+
+        // Append partial entry (simulate crash)
+        let mut partial = LogEntry::new(b"partial", b"entry", 1699564801);
+        partial.calculate_crc();
+        let serialized = partial.serialize().unwrap();
+
+        let mut file = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+        use std::io::Write;
+        file.write_all(&serialized[..serialized.len() / 2]).unwrap();
+
+        // Iterator should handle gracefully
+        let reader = LogReader::new(&log_path).unwrap();
+        let valid_entries: Vec<_> = reader
+            .iter()
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter(|e| e.validate_crc())
+            .collect();
+
+        assert_eq!(valid_entries.len(), 1, "Should only get complete entry");
+        assert_eq!(valid_entries[0].key(), b"complete");
+    }
+
+    #[test]
+    fn test_reader_iterator_empty_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("empty.log");
+
+        // Create empty file
+        fs::write(&log_path, b"").unwrap();
+
+        let reader = LogReader::new(&log_path).unwrap();
+        let count = reader.iter().unwrap().count();
+
+        assert_eq!(count, 0, "Empty file should yield no entries");
+    }
+
+    #[test]
+    fn test_reader_concurrent_readers() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // Write test data
+        {
+            let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+            for i in 0..100 {
+                let mut entry = LogEntry::new(
+                    format!("key{}", i).as_bytes(),
+                    format!("value{}", i).as_bytes(),
+                    1699564800,
+                );
+                entry.calculate_crc();
+                writer.append(&entry).unwrap();
+            }
+            writer.sync().unwrap();
+        }
+
+        let path = Arc::new(log_path);
+
+        // Multiple readers should work concurrently
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                thread::spawn(move || {
+                    let reader = LogReader::new(&path).unwrap();
+                    let count = reader
+                        .iter()
+                        .unwrap()
+                        .filter_map(|r| r.ok())
+                        .filter(|e| e.validate_crc())
+                        .count();
+                    assert_eq!(count, 100);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

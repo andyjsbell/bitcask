@@ -6,7 +6,8 @@ use std::{
     },
     fmt::Display,
     fs::OpenOptions,
-    io::{Error, ErrorKind, Write},
+    io::{Error, ErrorKind, Read, Seek, SeekFrom, Write},
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
 };
 
@@ -111,11 +112,27 @@ impl LogPointer {
 }
 
 #[derive(Serialize, Deserialize)]
-struct LogEntryHeader {
+pub struct LogEntryHeader {
     crc: CRC,
     timestamp: u64,
     key_len: u32,
     value_len: u32,
+}
+
+impl LogEntryHeader {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, StorageError> {
+        let crc = u32::from_le_bytes(bytes[0..4].try_into()?);
+        let key_len = u32::from_le_bytes(bytes[4..8].try_into()?);
+        let value_len = u32::from_le_bytes(bytes[8..12].try_into()?);
+        let timestamp = u64::from_le_bytes(bytes[12..20].try_into()?);
+
+        Ok(LogEntryHeader {
+            crc,
+            timestamp,
+            key_len,
+            value_len,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -201,22 +218,22 @@ impl LogEntry {
         }
         #[cfg(not(feature = "bincode"))]
         {
-            let crc = u32::from_le_bytes(bytes[0..4].try_into()?);
-            let key_len = u32::from_le_bytes(bytes[4..8].try_into()?);
-            let value_len = u32::from_le_bytes(bytes[8..12].try_into()?);
-            let timestamp = u64::from_le_bytes(bytes[12..20].try_into()?);
-            let key = bytes[20..20 + key_len as usize].to_vec();
-            let value = bytes[(20 + key_len as usize)..].to_vec();
-            Ok(LogEntry {
-                header: LogEntryHeader {
-                    crc,
-                    timestamp,
-                    key_len,
-                    value_len,
-                },
-                key,
-                value,
-            })
+            let header = LogEntryHeader::from_bytes(&bytes[0..20])?;
+            let key = bytes[20..20 + header.key_len as usize].to_vec();
+            let value = bytes[(20 + header.key_len as usize)..].to_vec();
+            Ok(LogEntry { header, key, value })
+        }
+    }
+
+    pub fn deserialize_with_header(
+        header: LogEntryHeader,
+        bytes: &[u8],
+    ) -> Result<Self, StorageError> {
+        #[cfg(not(feature = "bincode"))]
+        {
+            let key = bytes[0..header.key_len as usize].to_vec();
+            let value = bytes[header.key_len as usize..].to_vec();
+            Ok(LogEntry { header, key, value })
         }
     }
 
@@ -283,6 +300,70 @@ impl From<Box<bincode::ErrorKind>> for StorageError {
 impl From<std::io::Error> for StorageError {
     fn from(err: std::io::Error) -> Self {
         StorageError::Io(err)
+    }
+}
+
+#[derive(Debug)]
+pub struct LogReader {
+    path: PathBuf,
+    current_file: Option<std::fs::File>,
+}
+
+impl LogReader {
+    pub fn new(path: &Path) -> Result<Self, StorageError> {
+        Ok(LogReader {
+            path: path.to_path_buf(),
+            current_file: Some(Self::open_read_only_file(path)?),
+        })
+    }
+
+    fn open_read_only_file(path: &Path) -> Result<std::fs::File, StorageError> {
+        Ok(OpenOptions::new().read(true).open(path)?)
+    }
+
+    pub fn read_at(&mut self, offset: Offset, size: Size) -> Result<LogEntry, StorageError> {
+        match &mut self.current_file {
+            Some(file) => {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut buffer = vec![0u8; size as usize];
+                file.read_exact(&mut buffer)?;
+                Ok(LogEntry::deserialize(&buffer)?)
+            }
+            None => Err(StorageError::Io(Error::new(
+                ErrorKind::InvalidFilename,
+                "Log file not found",
+            ))),
+        }
+    }
+
+    pub fn iter(&self) -> Result<LogReaderIterator, StorageError> {
+        let file = Self::open_read_only_file(&self.path)?;
+        Ok(LogReaderIterator { file })
+    }
+}
+
+pub struct LogReaderIterator {
+    file: std::fs::File,
+}
+
+impl Iterator for LogReaderIterator {
+    type Item = Result<LogEntry, StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(feature = "bincode")]
+        {
+            None
+        }
+        #[cfg(not(feature = "bincode"))]
+        {
+            let mut buffer = [0u8; HEADER_SIZE];
+            self.file.read_exact(&mut buffer).ok()?;
+            let header = LogEntryHeader::from_bytes(&buffer).ok()?;
+            let mut buffer = vec![0u8; (header.key_len + header.value_len) as usize];
+            self.file.read_exact(&mut buffer).ok()?;
+
+            Some(LogEntry::deserialize_with_header(header, &buffer))
+        }
     }
 }
 
