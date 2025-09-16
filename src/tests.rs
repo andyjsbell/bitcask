@@ -490,11 +490,12 @@ mod buffering_tests {
         writer.append(&entry).unwrap();
 
         // Without flush, file size might be 0 due to buffering
-        // This is expected and good for performance
         let metadata = fs::metadata(&log_path).unwrap();
-
-        // File size could be 0 (buffered) or serialized_size (unbuffered)
-        // Both are acceptable, but we need to handle both cases
+        assert_eq!(
+            metadata.len(),
+            0,
+            "Before flush, file should contain no data"
+        );
 
         // After flush, data must be in file
         writer.flush().unwrap();
