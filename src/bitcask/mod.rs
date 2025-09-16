@@ -7,7 +7,6 @@ use std::{
     fmt::Display,
     fs::OpenOptions,
     io::{Error, ErrorKind, Write},
-    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
 };
 
