@@ -17,6 +17,10 @@ pub const HEADER_SIZE: usize = 4 + 8 + 4 + 4 + 8 + 8;
 #[cfg(not(feature = "bincode"))]
 pub const HEADER_SIZE: usize = 20;
 
+fn log_file_path(file_id: FileID) -> String {
+    format!("{file_id:06}.log")
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct LogPointer {
     file_id: FileID,
@@ -53,7 +57,7 @@ impl LogPointer {
     pub fn file_path(&self, path: &str) -> PathBuf {
         let mut path_buf = PathBuf::new();
         path_buf.push(path);
-        path_buf.push(format!("{:06}.log", self.file_id));
+        path_buf.push(log_file_path(self.file_id));
         path_buf
     }
 }
