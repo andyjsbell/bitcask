@@ -278,12 +278,12 @@ where
     T: Write + AsRef<[u8]> + Default,
 {
     pub fn new(path: &Path) -> Result<Self, &'static str> {
-        Self::init(path, None)
+        Self::initialise(path, None)
     }
 
     pub fn with_options(path: &Path, size: Size) -> Result<Self, &'static str> {
         let current_file_id = 0;
-        Self::init(
+        Self::initialise(
             &path.join(log_file_path(current_file_id)),
             Some(RotationConfig {
                 max_file_size: size,
@@ -293,7 +293,7 @@ where
         )
     }
 
-    fn init(
+    fn initialise(
         current_file: &Path,
         rotation_config: Option<RotationConfig>,
     ) -> Result<Self, &'static str> {
