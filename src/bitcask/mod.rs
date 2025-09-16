@@ -74,12 +74,12 @@ fn log_file_path(file_id: FileID) -> String {
 pub struct LogPointer {
     file_id: FileID,
     offset: u64,
-    size: u32,
+    size: u64,
     timestamp: u64,
 }
 
 impl LogPointer {
-    pub fn new(file_id: FileID, offset: u64, size: u32, timestamp: u64) -> Self {
+    pub fn new(file_id: FileID, offset: u64, size: u64, timestamp: u64) -> Self {
         LogPointer {
             file_id,
             offset,
@@ -96,7 +96,7 @@ impl LogPointer {
         self.offset
     }
 
-    pub fn size(&self) -> u32 {
+    pub fn size(&self) -> u64 {
         self.size
     }
 
