@@ -297,12 +297,14 @@ where
         current_file: &Path,
         rotation_config: Option<RotationConfig>,
     ) -> Result<Self, &'static str> {
-        Ok(LogWriter {
+        let this = LogWriter {
             offset: 0,
             current_file: current_file.to_path_buf(),
             buffer: T::default(),
             rotation_config,
-        })
+        };
+        let _ = this.get_current_file()?;
+        Ok(this)
     }
 
     pub fn current_file_id(&self) -> FileID {
