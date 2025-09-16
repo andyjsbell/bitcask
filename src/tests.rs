@@ -553,3 +553,155 @@ mod buffering_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod file_rotation_tests {
+    use super::*;
+
+    #[test]
+    fn test_writer_with_size_limit() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create writer with max file size (e.g., 1KB)
+        let mut writer = LogWriter::<Vec<u8>>::with_options(
+            temp_dir.path(),
+            1024, // 1KB max file size
+        )
+        .unwrap();
+
+        // Writer should start with file_id 0
+        assert_eq!(writer.current_file_id(), 0);
+
+        // Create a 100-byte entry (approximate)
+        let value = vec![0xAB; 50];
+        let mut entry = LogEntry::new(b"key", &value, 1699564800);
+        entry.calculate_crc();
+
+        let entry_size = entry.serialize().unwrap().len();
+
+        // Write entries until we exceed 1KB
+        let mut total_written = 0;
+        let mut rotations = 0;
+        let mut last_file_id = 0;
+
+        for _ in 0..20 {
+            // Should trigger at least one rotation
+            writer.append(&entry).unwrap();
+            total_written += entry_size;
+
+            if writer.current_file_id() != last_file_id {
+                rotations += 1;
+                last_file_id = writer.current_file_id();
+            }
+        }
+
+        // Should have rotated at least once
+        assert!(rotations > 0, "Should rotate when exceeding size limit");
+        assert!(writer.current_file_id() > 0, "File ID should increment");
+
+        // Finish writing
+        drop(writer);
+
+        // Check that multiple log files exist
+        let log_files: Vec<_> = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .map(|ext| ext == "log")
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        assert!(log_files.len() > 1, "Should have multiple log files");
+    }
+
+    #[test]
+    fn test_writer_rotation_preserves_data() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut writer = LogWriter::<Vec<u8>>::with_options(
+            temp_dir.path(),
+            500, // Small limit to force rotation
+        )
+        .unwrap();
+
+        // Track what we write
+        let mut written_entries = Vec::new();
+
+        for i in 0..10 {
+            let mut entry = LogEntry::new(
+                format!("key{}", i).as_bytes(),
+                format!("value{}", i).as_bytes(),
+                1699564800 + i,
+            );
+            entry.calculate_crc();
+
+            let (offset, size) = writer.append_with_size(&entry).unwrap();
+            let file_id = writer.current_file_id();
+
+            written_entries.push((file_id, offset, size, entry));
+        }
+
+        writer.sync().unwrap();
+        drop(writer);
+
+        // Verify all data is preserved across multiple files
+        for (file_id, offset, size, original_entry) in written_entries {
+            let file_path = temp_dir.path().join(format!("{:06}.log", file_id));
+            assert!(file_path.exists(), "Log file {} should exist", file_id);
+
+            // Read back the entry
+            let data = fs::read(&file_path).unwrap();
+            assert!(
+                offset + size as u64 <= data.len() as u64,
+                "Entry should be within file bounds"
+            );
+
+            let entry_data = &data[offset as usize..(offset + size as u64) as usize];
+            let entry = LogEntry::deserialize(entry_data).unwrap();
+
+            assert_eq!(entry.key(), original_entry.key());
+            assert_eq!(entry.value(), original_entry.value());
+        }
+    }
+
+    #[test]
+    fn test_writer_rotation_atomic() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut writer = LogWriter::<Vec<u8>>::with_options(
+            temp_dir.path(),
+            100, // Very small to force rotation mid-write
+        )
+        .unwrap();
+
+        // Create an entry that won't fit in remaining space
+        let value = vec![0xCD; 80];
+        let mut entry = LogEntry::new(b"large", &value, 1699564800);
+        entry.calculate_crc();
+
+        // Write a small entry first
+        let mut small = LogEntry::new(b"s", b"v", 1699564800);
+        small.calculate_crc();
+        writer.append(&small).unwrap();
+
+        let file_before = writer.current_file_id();
+
+        // This should trigger rotation before writing
+        let (offset, _) = writer.append_with_size(&entry).unwrap();
+
+        let file_after = writer.current_file_id();
+
+        // Should have rotated
+        assert_eq!(file_after, file_before + 1);
+
+        // The large entry should be at start of new file
+        assert_eq!(
+            offset, 0,
+            "Large entry should start at beginning of new file"
+        );
+    }
+}
