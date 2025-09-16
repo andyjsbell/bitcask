@@ -706,3 +706,57 @@ mod file_rotation_tests {
         );
     }
 }
+#[cfg(test)]
+mod file_error_handling_tests {
+    use super::*;
+    use std::fs::File;
+
+    #[test]
+    fn test_writer_handles_permission_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("readonly.log");
+
+        // Create a read-only file
+        File::create(&log_path).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::Permissions::from_mode(0o444);
+            fs::set_permissions(&log_path, permissions).unwrap();
+        }
+
+        // Should fail to create writer for read-only file
+        let result = LogWriter::<Vec<u8>>::new(&log_path);
+
+        #[cfg(unix)]
+        {
+            assert!(
+                result.is_err(),
+                "Should fail to open read-only file for writing"
+            );
+            assert!(matches!(result.unwrap_err(), StorageError::Io(_)));
+        }
+    }
+
+    #[test]
+    fn test_writer_handles_disk_full() {
+        // This test is conceptual - actually filling disk is not practical
+        // But your implementation should handle write failures gracefully
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+        // If a write fails (e.g., disk full), it should return an error
+        // not panic
+        let huge_value = vec![0xFF; 1024 * 1024 * 100]; // 100MB
+        let mut entry = LogEntry::new(b"huge", &huge_value, 1699564800);
+        entry.calculate_crc();
+
+        // This might succeed or fail depending on available space
+        // The important thing is it returns Result, not panics
+        let _ = writer.append(&entry);
+    }
+}
