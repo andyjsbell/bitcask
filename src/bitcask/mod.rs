@@ -185,13 +185,13 @@ impl LogEntry {
 }
 
 #[derive(Debug)]
-pub enum StorageError<'a> {
+pub enum StorageError {
     Io(std::io::Error),
-    Corruption(&'a str),
-    Serialization(&'a str),
+    Corruption(String),
+    Serialization(String),
 }
 
-impl<'a> Display for StorageError<'a> {
+impl Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "IO Error: {e}"),
@@ -201,7 +201,7 @@ impl<'a> Display for StorageError<'a> {
     }
 }
 
-impl<'a> std::error::Error for StorageError<'a> {
+impl std::error::Error for StorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
@@ -210,29 +210,29 @@ impl<'a> std::error::Error for StorageError<'a> {
     }
 }
 
-impl<'a> StorageError<'a> {
-    pub fn corruption(e: &'a str) -> StorageError<'a> {
-        StorageError::Corruption(e)
+impl StorageError {
+    pub fn corruption(e: &str) -> StorageError {
+        StorageError::Corruption(e.into())
     }
-    pub fn serialization(e: &'a str) -> StorageError<'a> {
-        StorageError::Serialization(e)
+    pub fn serialization(e: &str) -> StorageError {
+        StorageError::Serialization(e.into())
     }
 }
 
-impl<'a> From<TryFromSliceError> for StorageError<'a> {
+impl From<TryFromSliceError> for StorageError {
     fn from(_: TryFromSliceError) -> Self {
-        Self::Serialization("slice error")
+        Self::Serialization("slice error".into())
     }
 }
 
 #[cfg(feature = "bincode")]
-impl<'a> From<Box<bincode::ErrorKind>> for StorageError<'a> {
+impl From<Box<bincode::ErrorKind>> for StorageError {
     fn from(_: Box<bincode::ErrorKind>) -> Self {
-        StorageError::Serialization("serialization error")
+        StorageError::Serialization("serialization error".into())
     }
 }
 
-impl<'a> From<std::io::Error> for StorageError<'a> {
+impl From<std::io::Error> for StorageError {
     fn from(err: std::io::Error) -> Self {
         StorageError::Io(err)
     }
@@ -241,6 +241,7 @@ impl<'a> From<std::io::Error> for StorageError<'a> {
 pub type Offset = u64;
 pub type Size = u64;
 
+#[derive(Debug)]
 struct RotationConfig {
     base_dir: PathBuf,
     max_file_size: Size,
@@ -254,6 +255,7 @@ impl RotationConfig {
     }
 }
 
+#[derive(Debug)]
 pub struct LogWriter<T>
 where
     T: Write + AsRef<[u8]> + Default,
@@ -277,11 +279,11 @@ impl<T> LogWriter<T>
 where
     T: Write + AsRef<[u8]> + Default,
 {
-    pub fn new(path: &Path) -> Result<Self, &'static str> {
+    pub fn new(path: &Path) -> Result<Self, StorageError> {
         Self::initialise(path, None)
     }
 
-    pub fn with_options(path: &Path, size: Size) -> Result<Self, &'static str> {
+    pub fn with_options(path: &Path, size: Size) -> Result<Self, StorageError> {
         let current_file_id = 0;
         Self::initialise(
             &path.join(log_file_path(current_file_id)),
@@ -296,7 +298,7 @@ where
     fn initialise(
         current_file: &Path,
         rotation_config: Option<RotationConfig>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, StorageError> {
         let this = LogWriter {
             offset: 0,
             current_file: current_file.to_path_buf(),
@@ -323,11 +325,8 @@ where
         self.offset = 0;
     }
 
-    fn write_to_buffer(&mut self, bytes: &[u8]) -> Result<u64, &'static str> {
-        self.buffer
-            .write_all(&bytes)
-            .map_err(|_| "failed to write")?;
-
+    fn write_to_buffer(&mut self, bytes: &[u8]) -> Result<u64, StorageError> {
+        self.buffer.write_all(&bytes)?;
         let offset = self.offset;
         self.offset += bytes.len() as Size;
         Ok(offset)
@@ -343,9 +342,12 @@ where
         }
     }
 
-    pub fn rotate(&mut self) -> Result<(), &'static str> {
+    pub fn rotate(&mut self) -> Result<(), StorageError> {
         if self.rotation_config.is_none() {
-            return Err("No rotation config available");
+            return Err(StorageError::Io(Error::new(
+                ErrorKind::InvalidData,
+                "No rotation configuration available",
+            )));
         }
 
         self.flush()?;
@@ -361,43 +363,41 @@ where
         Ok(())
     }
 
-    pub fn append(&mut self, entry: &LogEntry) -> Result<Offset, &'static str> {
+    pub fn append(&mut self, entry: &LogEntry) -> Result<Offset, StorageError> {
         Ok(self.append_with_size(entry)?.0)
     }
 
-    pub fn append_with_size(&mut self, entry: &LogEntry) -> Result<(Offset, Size), &'static str> {
+    pub fn append_with_size(&mut self, entry: &LogEntry) -> Result<(Offset, Size), StorageError> {
         if self.should_rotate(entry) {
             self.rotate()?;
         }
-        let bytes = entry.serialize().map_err(|_| "failed to serialize")?;
+        let bytes = entry.serialize()?;
         let offset = self.write_to_buffer(&bytes)?;
         Ok((offset, bytes.len() as Size))
     }
 
-    fn get_current_file(&self) -> Result<std::fs::File, &'static str> {
-        OpenOptions::new()
+    fn get_current_file(&self) -> Result<std::fs::File, StorageError> {
+        Ok(OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.current_file)
-            .map_err(|_| "failed to open file")
+            .open(&self.current_file)?)
     }
 
-    fn write_to_file(&mut self, file: &mut std::fs::File) -> Result<(), &'static str> {
-        file.write_all(self.buffer.as_ref())
-            .map_err(|_| "writing to file failed")?;
+    fn write_to_file(&mut self, file: &mut std::fs::File) -> Result<(), StorageError> {
+        file.write_all(self.buffer.as_ref())?;
         self.reset_buffer();
         Ok(())
     }
 
-    pub fn flush(&mut self) -> Result<(), &'static str> {
+    pub fn flush(&mut self) -> Result<(), StorageError> {
         let mut file = self.get_current_file()?;
         self.write_to_file(&mut file)?;
         Ok(())
     }
 
-    pub fn sync(&mut self) -> Result<(), &'static str> {
+    pub fn sync(&mut self) -> Result<(), StorageError> {
         let mut file = self.get_current_file()?;
         self.write_to_file(&mut file)?;
-        file.sync_all().map_err(|_| "failed to sync")
+        Ok(file.sync_all()?)
     }
 }
