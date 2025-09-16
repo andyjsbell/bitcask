@@ -240,7 +240,6 @@ impl<'a> From<std::io::Error> for StorageError<'a> {
 
 pub type Offset = u64;
 pub type Size = u64;
-const DEFAULT_FILE_SIZE: Size = 1024 * 1024;
 
 struct RotationConfig {
     base_dir: PathBuf,
