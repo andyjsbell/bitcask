@@ -178,6 +178,10 @@ impl LogEntry {
         let checksum = crc.checksum(&bytes);
         checksum == self.crc()
     }
+
+    pub fn size(&self) -> usize {
+        HEADER_SIZE + self.key.len() + self.value.len()
+    }
 }
 
 #[derive(Debug)]
