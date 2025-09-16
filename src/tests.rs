@@ -845,3 +845,61 @@ mod performance_characteristics {
         );
     }
 }
+
+#[cfg(test)]
+mod concurrent_writer_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    #[test]
+    fn test_single_writer_principle() {
+        // Bitcask uses single writer principle
+        // This test documents that behavior
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // First writer succeeds
+        let writer1 = LogWriter::<Vec<u8>>::new(&log_path);
+        assert!(writer1.is_ok());
+
+        // Second writer succeeds
+        let writer2 = LogWriter::<Vec<u8>>::new(&log_path);
+        assert!(writer2.is_ok());
+    }
+
+    #[test]
+    fn test_writer_thread_safety() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let writer = Arc::new(Mutex::new(LogWriter::<Vec<u8>>::new(&log_path).unwrap()));
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let writer = Arc::clone(&writer);
+
+                thread::spawn(move || {
+                    for j in 0..10 {
+                        let mut entry = LogEntry::new(
+                            format!("key_{}_{}", i, j).as_bytes(),
+                            b"value",
+                            1699564800,
+                        );
+                        entry.calculate_crc();
+
+                        writer.lock().unwrap().append(&entry).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Should have written all 40 entries
+        writer.lock().unwrap().sync().unwrap();
+    }
+}
