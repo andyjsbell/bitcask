@@ -382,19 +382,22 @@ where
             .map_err(|_| "failed to open file")
     }
 
-    pub fn flush(&mut self) -> Result<(), &'static str> {
-        let mut file = self.get_current_file()?;
-
+    fn write_to_file(&mut self, file: &mut std::fs::File) -> Result<(), &'static str> {
         file.write_all(self.buffer.as_ref())
             .map_err(|_| "writing to file failed")?;
-
         self.reset_buffer();
         Ok(())
     }
 
-    pub fn sync(&self) -> Result<(), &'static str> {
-        let file = self.get_current_file()?;
+    pub fn flush(&mut self) -> Result<(), &'static str> {
+        let mut file = self.get_current_file()?;
+        self.write_to_file(&mut file)?;
+        Ok(())
+    }
 
+    pub fn sync(&mut self) -> Result<(), &'static str> {
+        let mut file = self.get_current_file()?;
+        self.write_to_file(&mut file)?;
         file.sync_all().map_err(|_| "failed to sync")
     }
 }
