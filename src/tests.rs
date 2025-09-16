@@ -453,7 +453,7 @@ mod basic_writer_tests {
             let mut entry = LogEntry::new(&key, &value, 1699564800);
             entry.calculate_crc();
 
-            let expected_size = entry.serialize().unwrap().len() as u32;
+            let expected_size = entry.serialize().unwrap().len() as u64;
 
             // append_with_size should return both offset and actual size
             let (offset, size) = writer.append_with_size(&entry).unwrap();
