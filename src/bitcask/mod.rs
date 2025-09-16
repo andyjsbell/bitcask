@@ -194,9 +194,9 @@ pub enum StorageError<'a> {
 impl<'a> Display for StorageError<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "IO Error: {}", e),
-            Self::Corruption(e) => write!(f, "Corruption: {}", e),
-            Self::Serialization(e) => write!(f, "Serialization: {}", e),
+            Self::Io(e) => write!(f, "IO Error: {e}"),
+            Self::Corruption(e) => write!(f, "Corruption: {e}"),
+            Self::Serialization(e) => write!(f, "Serialization: {e}"),
         }
     }
 }
