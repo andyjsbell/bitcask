@@ -1,4 +1,5 @@
 use crc::{CRC_32_ISO_HDLC, Crc};
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::{
     array::TryFromSliceError,
@@ -33,6 +34,7 @@ pub struct Bitcask {
 
 impl Bitcask {
     pub fn open_with_options(path: &Path, options: BitcaskOptions) -> Result<Self, StorageError> {
+        info!("Opening Bitcask at {:?} with options {:?}", path, options);
         Ok(if Self::has_log_files(path)? {
             let (writer, memory_index) = Self::restore(path)?;
             Bitcask {
@@ -127,6 +129,7 @@ impl Bitcask {
         path: &Path,
         memory_map: HashMap<Vec<u8>, LogEntry>,
     ) -> Result<(MemoryLogWriter, MemIndex), StorageError> {
+        debug!("Rebuilding path {:?}", path);
         let mut writer = MemoryLogWriter::with_options(path, ROTATION_FILE_SIZE)?;
         let mut memory_index = MemIndex::new();
         for (key, entry) in memory_map {
@@ -167,6 +170,7 @@ impl Bitcask {
     }
 
     fn restore(path: &Path) -> Result<(MemoryLogWriter, MemIndex), StorageError> {
+        info!("Restoring at path {:?}", path);
         let mut memory_map = HashMap::<Vec<u8>, LogEntry>::new();
         let log_files: Vec<_> = std::fs::read_dir(path)?
             .filter_map(|e| e.ok())
@@ -511,6 +515,8 @@ pub struct LogReader {
 
 impl LogReader {
     pub fn new(path: &Path) -> Result<Self, StorageError> {
+        debug!("LogReader for path {:?}", path);
+
         Ok(LogReader {
             path: path.to_path_buf(),
             current_file: Some(RefCell::new(Self::open_read_only_file(path)?)),
