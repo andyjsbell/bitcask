@@ -109,6 +109,10 @@ impl Bitcask {
         })
     }
 
+    pub fn flush(&self) -> Result<(), StorageError> {
+        self.writer.borrow_mut().flush()
+    }
+
     pub fn sync(&self) -> Result<(), StorageError> {
         self.writer.borrow_mut().sync()
     }
