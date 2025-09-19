@@ -101,7 +101,7 @@ impl Bitcask {
                 let mut entry = self.get_entry(pointer)?;
                 let value = entry.value.clone();
                 entry.tombstone();
-                let offset = self.writer.borrow_mut().append(&entry)?;
+                self.writer.borrow_mut().append(&entry)?;
                 memory_index.delete(key);
                 Some(value)
             }
@@ -142,7 +142,7 @@ impl Bitcask {
             );
             let _ = memory_index.insert(key, pointer);
         }
-
+        writer.flush()?;
         Ok((writer, memory_index))
     }
 
@@ -181,7 +181,8 @@ impl Bitcask {
             let reader = LogReader::new(&log_file.path())?;
 
             for entry in reader.iter()? {
-                if !entry.is_tombstone() {
+                if entry.is_tombstone() {
+                    debug!("Removing tombstone {:?}", entry.key());
                     memory_map.remove(entry.key());
                 } else {
                     memory_map.insert(entry.key().to_vec(), entry.clone());
@@ -191,11 +192,11 @@ impl Bitcask {
 
         let compact_directory = path.join(".compacting");
         std::fs::create_dir_all(&compact_directory)?;
-        let result = Self::rebuild(&compact_directory, memory_map)?;
+        let (mut writer, memory_index) = Self::rebuild(&compact_directory, memory_map)?;
         Self::clear_all_files(&log_files)?;
         Self::move_files(&compact_directory, path)?;
-
-        Ok(result)
+        writer.move_path(path);
+        Ok((writer, memory_index))
     }
 
     pub fn compact(&mut self) -> Result<(), StorageError> {
@@ -610,6 +611,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct BitcaskOptions {
     size: Size,
 }
@@ -654,6 +656,10 @@ where
         };
         let _ = this.get_current_file()?;
         Ok(this)
+    }
+
+    pub fn move_path(&mut self, path: &Path) {
+        self.current_file = path.join(log_file_path(self.current_file_id()));
     }
 
     pub fn current_file_id(&self) -> FileID {
