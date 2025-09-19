@@ -29,7 +29,6 @@ index.insert(b"key".to_vec(), LogPointer::new(0, offset, size, timestamp));
 let reader = LogReader::new(&path)?;
 if let Some(pointer) = index.get(b"key") {
     let entry = reader.read_at(pointer.offset(), pointer.size())?;
-    println!("Value: {:?}", entry.value());
 }
 ```
 
