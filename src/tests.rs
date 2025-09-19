@@ -1,4 +1,4 @@
-use crate::bitcask::{LogEntry, LogPointer, LogReader, LogWriter, MemIndex, StorageError};
+use crate::bitcask::{Bitcask, LogEntry, LogPointer, LogReader, LogWriter, MemIndex, StorageError};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
@@ -178,6 +178,8 @@ mod log_entry_tests {
 
 #[cfg(test)]
 mod log_pointer_tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
 
     #[test]
@@ -233,12 +235,12 @@ mod log_pointer_tests {
         // Should generate correct file paths from file_id
         let pointer = LogPointer::new(7, 0, 0, 0);
 
-        let path = pointer.file_path("data");
+        let path = pointer.file_path(&PathBuf::from("data"));
         assert_eq!(path.to_str().unwrap(), "data/000007.log");
 
         // Should handle large file IDs
         let pointer2 = LogPointer::new(999999, 0, 0, 0);
-        let path2 = pointer2.file_path("data");
+        let path2 = pointer2.file_path(&PathBuf::from("data"));
         assert_eq!(path2.to_str().unwrap(), "data/999999.log");
     }
 
@@ -419,8 +421,7 @@ mod integration_tests {
         let reader = LogReader::new(&log_path).unwrap();
         let mut offset = 0u64;
 
-        for result in reader.iter().unwrap() {
-            let entry = result.unwrap();
+        for entry in reader.iter().unwrap() {
             let size = entry.serialize().unwrap().len() as u64;
 
             let pointer = LogPointer::new(0, offset, size, entry.timestamp());
@@ -1368,7 +1369,7 @@ mod logreader_tests {
             writer.sync().unwrap();
         }
 
-        let mut reader = LogReader::new(&log_path).unwrap();
+        let reader = LogReader::new(&log_path).unwrap();
 
         // Try to read beyond file
         let result = reader.read_at(10000, 100);
@@ -1391,7 +1392,7 @@ mod logreader_tests {
         fs::write(&log_path, serialized).unwrap();
 
         // Read should succeed but CRC validation should fail
-        let mut reader = LogReader::new(&log_path).unwrap();
+        let reader = LogReader::new(&log_path).unwrap();
         let read_entry = reader.read_at(0, size).unwrap();
 
         assert!(!read_entry.validate_crc(), "Should detect corruption");
@@ -1425,8 +1426,7 @@ mod logreader_tests {
         let reader = LogReader::new(&log_path).unwrap();
         let mut count = 0;
 
-        for (i, result) in reader.iter().unwrap().enumerate() {
-            let entry = result.unwrap();
+        for (i, entry) in reader.iter().unwrap().enumerate() {
             assert!(entry.validate_crc());
             assert_eq!(entry.key(), expected[i].0);
             assert_eq!(entry.value(), expected[i].1);
@@ -1464,7 +1464,6 @@ mod logreader_tests {
         let valid_entries: Vec<_> = reader
             .iter()
             .unwrap()
-            .filter_map(|r| r.ok())
             .filter(|e| e.validate_crc())
             .collect();
 
@@ -1517,12 +1516,7 @@ mod logreader_tests {
                 let path = Arc::clone(&path);
                 thread::spawn(move || {
                     let reader = LogReader::new(&path).unwrap();
-                    let count = reader
-                        .iter()
-                        .unwrap()
-                        .filter_map(|r| r.ok())
-                        .filter(|e| e.validate_crc())
-                        .count();
+                    let count = reader.iter().unwrap().filter(|e| e.validate_crc()).count();
                     assert_eq!(count, 100);
                 })
             })
@@ -1531,5 +1525,326 @@ mod logreader_tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+}
+
+mod tombstone_tests {
+    use super::*;
+
+    #[test]
+    fn test_logentry_tombstone_creation() {
+        // Test that we can create a tombstone entry
+
+        // Option 1: Empty value as tombstone
+        let tombstone = LogEntry::new(b"deleted_key", b"", 1699564800);
+        assert_eq!(tombstone.value(), b"");
+        assert_eq!(tombstone.key(), b"deleted_key");
+
+        // Option 2: If you have a special tombstone constructor
+        // let tombstone = LogEntry::new_tombstone(b"deleted_key", 1699564800);
+        // assert!(tombstone.is_tombstone());
+    }
+
+    #[test]
+    fn test_tombstone_serialization() {
+        // Tombstones should serialize/deserialize correctly
+        let mut tombstone = LogEntry::new(b"key_to_delete", b"", 1699564800);
+        tombstone.calculate_crc();
+
+        let serialized = tombstone.serialize().unwrap();
+        let deserialized = LogEntry::deserialize(&serialized).unwrap();
+
+        assert_eq!(deserialized.key(), b"key_to_delete");
+        assert_eq!(deserialized.value(), b"");
+        assert!(deserialized.validate_crc());
+    }
+
+    #[test]
+    fn test_writer_append_tombstone() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let mut writer = LogWriter::<Vec<u8>>::new(&log_path).unwrap();
+
+        // Write normal entry
+        let mut entry = LogEntry::new(b"key", b"value", 1699564800);
+        entry.calculate_crc();
+        writer.append(&entry).unwrap();
+
+        // Write tombstone
+        let mut tombstone = LogEntry::new(b"key", b"", 1699564801);
+        tombstone.calculate_crc();
+        let offset = writer.append(&tombstone).unwrap();
+
+        assert!(offset > 0, "Tombstone should be written after first entry");
+
+        writer.sync().unwrap();
+
+        // Verify both entries are in the log
+        let reader = LogReader::new(&log_path).unwrap();
+        let entries: Vec<_> = reader.iter().unwrap().collect();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].value(), b"value");
+        assert_eq!(entries[1].value(), b""); // tombstone
+    }
+
+    #[test]
+    fn test_delete_operation_flow() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Bitcask::open(temp_dir.path()).unwrap();
+
+        // Put a value
+        db.put(b"key", b"value").unwrap();
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value".to_vec()));
+
+        // Delete it
+        db.delete(b"key").unwrap();
+
+        // Should no longer be accessible
+        assert_eq!(db.get(b"key").unwrap(), None);
+
+        // Delete again should be idempotent (no error)
+        db.delete(b"key").unwrap();
+        assert_eq!(db.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_tombstone_in_log_after_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+
+        {
+            let db = Bitcask::open(&db_path).unwrap();
+            db.put(b"key", b"value").unwrap();
+            db.delete(b"key").unwrap();
+            db.sync().unwrap();
+        }
+
+        // Read the log directly
+        let log_path = db_path.join("000000.log");
+        let reader = LogReader::new(&log_path).unwrap();
+        let entries: Vec<_> = reader.iter().unwrap().collect();
+
+        // Should have both entries: original and tombstone
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].value(), b"value");
+        assert_eq!(entries[1].value(), b""); // tombstone
+        assert_eq!(entries[1].key(), b"key"); // same key
+    }
+
+    #[test]
+    fn test_recovery_with_tombstones() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+
+        // Create entries with deletes
+        {
+            let db = Bitcask::open(&db_path).unwrap();
+
+            // Write some entries
+            db.put(b"keep1", b"value1").unwrap();
+            db.put(b"delete1", b"value2").unwrap();
+            db.put(b"keep2", b"value3").unwrap();
+            db.put(b"delete2", b"value4").unwrap();
+
+            // Delete some
+            db.delete(b"delete1").unwrap();
+            db.delete(b"delete2").unwrap();
+
+            db.sync().unwrap();
+        }
+
+        // Reopen and verify deletes were recovered
+        {
+            let db = Bitcask::open(&db_path).unwrap();
+
+            // Kept entries should exist
+            assert_eq!(db.get(b"keep1").unwrap(), Some(b"value1".to_vec())); // FAILS HERE
+            assert_eq!(db.get(b"keep2").unwrap(), Some(b"value3".to_vec()));
+
+            // Deleted entries should not exist
+            assert_eq!(db.get(b"delete1").unwrap(), None);
+            assert_eq!(db.get(b"delete2").unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn test_delete_then_reinsert() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Bitcask::open(temp_dir.path()).unwrap();
+
+        println!("put value1");
+        // Put, delete, put again
+        db.put(b"key", b"value1").unwrap();
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value1".to_vec()));
+
+        db.delete(b"key").unwrap();
+        assert_eq!(db.get(b"key").unwrap(), None);
+        println!("put value2");
+        db.put(b"key", b"value2").unwrap();
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value2".to_vec()));
+    }
+
+    #[test]
+    fn test_recovery_with_interleaved_tombstones() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+
+        {
+            let db = Bitcask::open(&db_path).unwrap();
+
+            // Complex sequence of operations
+            db.put(b"a", b"1").unwrap();
+            db.put(b"b", b"2").unwrap();
+            db.delete(b"a").unwrap(); // tombstone for a
+            db.put(b"c", b"3").unwrap();
+            db.put(b"a", b"4").unwrap(); // a is back with new value
+            db.delete(b"b").unwrap(); // tombstone for b
+
+            db.sync().unwrap();
+        }
+
+        // After recovery
+        {
+            let db = Bitcask::open(&db_path).unwrap();
+
+            assert_eq!(db.get(b"a").unwrap(), Some(b"4".to_vec())); // reinserted
+            assert_eq!(db.get(b"b").unwrap(), None); // deleted
+            assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec())); // unchanged
+        }
+    }
+
+    #[test]
+    fn test_delete_nonexistent_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Bitcask::open(temp_dir.path()).unwrap();
+
+        // Deleting non-existent key should not error (idempotent)
+        let result = db.delete(b"never_existed");
+        assert!(result.is_ok(), "Delete of non-existent key should succeed");
+
+        // Should still not exist
+        assert_eq!(db.get(b"never_existed").unwrap(), None);
+    }
+
+    #[test]
+    fn test_tombstone_size_in_log() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+
+        {
+            let mut db = Bitcask::open(&db_path).unwrap();
+
+            // Write and delete many entries
+            for i in 0..10 {
+                let key = format!("key{}", i);
+                db.put(key.as_bytes(), b"value").unwrap();
+            }
+
+            for i in 0..10 {
+                let key = format!("key{}", i);
+                db.delete(key.as_bytes()).unwrap();
+            }
+
+            db.sync().unwrap();
+        }
+
+        // Check log file size - should have 20 entries (10 puts + 10 tombstones)
+        let log_path = db_path.join("000000.log");
+        let reader = LogReader::new(&log_path).unwrap();
+        let entry_count = reader.iter().unwrap().count();
+
+        assert_eq!(
+            entry_count, 20,
+            "Should have original entries plus tombstones"
+        );
+    }
+
+    #[test]
+    fn test_compaction_removes_tombstones() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+
+        let mut db = Bitcask::open(&db_path).unwrap();
+
+        // Create entries and delete some
+        for i in 0..10 {
+            let key = format!("key{}", i);
+            db.put(key.as_bytes(), b"value").unwrap();
+        }
+
+        // Delete even-numbered keys
+        for i in (0..10).step_by(2) {
+            let key = format!("key{}", i);
+            db.delete(key.as_bytes()).unwrap();
+        }
+
+        db.sync().unwrap();
+
+        // If compaction is implemented
+        if db.compact().is_ok() {
+            // After compaction, log should only have 5 entries (odd keys)
+            // Tombstones and their corresponding entries should be gone
+
+            let log_files: Vec<_> = std::fs::read_dir(&db_path)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension() == Some("log".as_ref()))
+                .collect();
+
+            // Read the compacted log
+            let mut total_entries = 0;
+            for file in log_files {
+                let reader = LogReader::new(&file.path()).unwrap();
+                total_entries += reader.iter().unwrap().count();
+            }
+
+            // Should have only the 5 remaining keys, no tombstones
+            assert!(
+                total_entries <= 5,
+                "After compaction, should have at most 5 entries, got {}",
+                total_entries
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod edge_case_tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_value_vs_tombstone() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut db = Bitcask::open(temp_dir.path()).unwrap();
+
+        // Put an empty value (not a delete)
+        db.put(b"empty_value_key", b"").unwrap();
+
+        // Should still exist (empty value != deleted)
+        // Unless you're using empty value as tombstone marker
+        let result = db.get(b"empty_value_key").unwrap();
+
+        // Document your choice:
+        // If empty values are allowed:
+        // assert_eq!(result, Some(Vec::new()));
+
+        // If empty values are tombstones:
+        // assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_large_key_tombstone() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut db = Bitcask::open(temp_dir.path()).unwrap();
+
+        // Large key
+        let large_key = vec![0xAB; 1024];
+
+        db.put(&large_key, b"value").unwrap();
+        db.delete(&large_key).unwrap();
+
+        // assert_eq!(db.get(&large_key).unwrap(), None);
     }
 }
