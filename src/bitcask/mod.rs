@@ -1,26 +1,211 @@
+use crc::{CRC_32_ISO_HDLC, Crc};
+use serde::{Deserialize, Serialize};
 use std::{
     array::TryFromSliceError,
+    cell::RefCell,
     collections::{
         HashMap,
-        hash_map::{Iter, Keys},
+        hash_map::{Entry, Iter, Keys},
     },
     fmt::Display,
-    fs::OpenOptions,
+    fs::{DirEntry, OpenOptions},
     io::{Error, ErrorKind, Read, Seek, SeekFrom, Write},
-    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use crc::{CRC_32_ISO_HDLC, Crc};
 type CRC = u32;
 type FileID = u32;
-
-use serde::{Deserialize, Serialize};
-
 #[cfg(feature = "bincode")]
 pub const HEADER_SIZE: usize = 4 + 8 + 4 + 4 + 8 + 8;
 #[cfg(not(feature = "bincode"))]
 pub const HEADER_SIZE: usize = 20;
+pub const ROTATION_FILE_SIZE: Size = 1024 * 1024;
+
+pub type MemoryLogWriter = LogWriter<Vec<u8>>;
+
+pub struct Bitcask {
+    path: PathBuf,
+    writer: RefCell<MemoryLogWriter>,
+    readers: RefCell<HashMap<FileID, LogReader>>,
+    memory_index: RefCell<MemIndex>,
+}
+
+impl Bitcask {
+    pub fn open_with_options(path: &Path, options: BitcaskOptions) -> Result<Self, StorageError> {
+        Ok(if Self::has_log_files(path)? {
+            let (writer, memory_index) = Self::restore(path)?;
+            Bitcask {
+                path: path.to_path_buf(),
+                writer: RefCell::new(writer),
+                readers: RefCell::new(HashMap::new()),
+                memory_index: RefCell::new(memory_index),
+            }
+        } else {
+            Bitcask {
+                path: path.to_path_buf(),
+                writer: RefCell::new(MemoryLogWriter::with_options(path, options.size)?),
+                readers: RefCell::new(HashMap::new()),
+                memory_index: RefCell::new(MemIndex::new()),
+            }
+        })
+    }
+
+    pub fn open(path: &Path) -> Result<Self, StorageError> {
+        Self::open_with_options(path, BitcaskOptions::default())
+    }
+
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let timestamp = current_timestamp();
+
+        let entry = LogEntry::new(key, value, timestamp);
+        let mut writer = self.writer.borrow_mut();
+        let offset = writer.append(&entry)?;
+
+        let pointer = LogPointer::new(
+            writer.current_file_id(),
+            offset,
+            entry.size() as u64,
+            timestamp,
+        );
+        self.memory_index.borrow_mut().insert(key.to_vec(), pointer);
+
+        Ok(())
+    }
+
+    fn get_entry(&self, pointer: &LogPointer) -> Result<LogEntry, StorageError> {
+        self.writer.borrow_mut().flush()?;
+        match self.readers.borrow_mut().entry(pointer.file_id()) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(LogReader::new(&pointer.file_path(&self.path))?),
+        }
+        .read_at(pointer.offset(), pointer.size())
+    }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(match self.memory_index.borrow().get(key) {
+            Some(pointer) => {
+                let entry = self.get_entry(pointer)?;
+                Some(entry.value().to_vec())
+            }
+            None => None,
+        })
+    }
+
+    pub fn delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        let mut memory_index = self.memory_index.borrow_mut();
+        Ok(match memory_index.get(key) {
+            Some(pointer) => {
+                let mut entry = self.get_entry(pointer)?;
+                let value = entry.value.clone();
+                entry.tombstone();
+                let offset = self.writer.borrow_mut().append(&entry)?;
+                memory_index.delete(key);
+                Some(value)
+            }
+            None => None,
+        })
+    }
+
+    pub fn sync(&self) -> Result<(), StorageError> {
+        self.writer.borrow_mut().sync()
+    }
+
+    fn has_log_files(path: &Path) -> Result<bool, StorageError> {
+        // Check if any .log files exist
+        for entry in std::fs::read_dir(path)? {
+            if let Ok(entry) = entry {
+                if entry.path().extension() == Some("log".as_ref()) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn rebuild(
+        path: &Path,
+        memory_map: HashMap<Vec<u8>, LogEntry>,
+    ) -> Result<(MemoryLogWriter, MemIndex), StorageError> {
+        let mut writer = MemoryLogWriter::with_options(path, ROTATION_FILE_SIZE)?;
+        let mut memory_index = MemIndex::new();
+        for (key, entry) in memory_map {
+            let offset = writer.append(&entry)?;
+            let pointer = LogPointer::new(
+                writer.current_file_id(),
+                offset,
+                entry.size() as u64,
+                entry.timestamp(),
+            );
+            let _ = memory_index.insert(key, pointer);
+        }
+
+        Ok((writer, memory_index))
+    }
+
+    fn clear_all_files(log_files: &Vec<DirEntry>) -> Result<(), StorageError> {
+        for log_file in log_files {
+            std::fs::remove_file(log_file.path())?;
+        }
+
+        Ok(())
+    }
+
+    fn move_files(from: &Path, to: &Path) -> Result<(), StorageError> {
+        let log_files: Vec<_> = std::fs::read_dir(from)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension() == Some("log".as_ref()))
+            .collect();
+
+        for log_file in log_files {
+            let mut to = to.to_path_buf();
+            to.push(log_file.file_name());
+            std::fs::rename(&log_file.path(), &to)?;
+        }
+
+        Ok(())
+    }
+
+    fn restore(path: &Path) -> Result<(MemoryLogWriter, MemIndex), StorageError> {
+        let mut memory_map = HashMap::<Vec<u8>, LogEntry>::new();
+        let log_files: Vec<_> = std::fs::read_dir(path)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension() == Some("log".as_ref()))
+            .collect();
+
+        for log_file in &log_files {
+            let reader = LogReader::new(&log_file.path())?;
+
+            for entry in reader.iter()? {
+                if !entry.is_tombstone() {
+                    memory_map.remove(entry.key());
+                } else {
+                    memory_map.insert(entry.key().to_vec(), entry.clone());
+                }
+            }
+        }
+
+        let compact_directory = path.join(".compacting");
+        std::fs::create_dir_all(&compact_directory)?;
+        let result = Self::rebuild(&compact_directory, memory_map)?;
+        Self::clear_all_files(&log_files)?;
+        Self::move_files(&compact_directory, path)?;
+
+        Ok(result)
+    }
+
+    pub fn compact(&mut self) -> Result<(), StorageError> {
+        let _ = Self::restore(&self.path);
+        Ok(())
+    }
+}
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
 
 pub struct MemIndex {
     index: HashMap<Vec<u8>, LogPointer>,
@@ -70,10 +255,12 @@ fn log_file_path(file_id: FileID) -> String {
     format!("{file_id:06}.log")
 }
 
+type Offset = u64;
+type FileOffset = (FileID, Offset);
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct LogPointer {
-    file_id: FileID,
-    offset: u64,
+    file_offset: FileOffset,
     size: u64,
     timestamp: u64,
 }
@@ -81,19 +268,22 @@ pub struct LogPointer {
 impl LogPointer {
     pub fn new(file_id: FileID, offset: u64, size: u64, timestamp: u64) -> Self {
         LogPointer {
-            file_id,
-            offset,
+            file_offset: (file_id, offset),
             size,
             timestamp,
         }
     }
 
     pub fn file_id(&self) -> FileID {
-        self.file_id
+        self.file_offset.0
     }
 
-    pub fn offset(&self) -> u64 {
-        self.offset
+    pub fn file_offset(&self) -> FileOffset {
+        self.file_offset
+    }
+
+    pub fn offset(&self) -> Offset {
+        self.file_offset.1
     }
 
     pub fn size(&self) -> u64 {
@@ -103,15 +293,15 @@ impl LogPointer {
     pub fn timestamp(&self) -> u64 {
         self.timestamp
     }
-    pub fn file_path(&self, path: &str) -> PathBuf {
-        let mut path_buf = PathBuf::new();
-        path_buf.push(path);
-        path_buf.push(log_file_path(self.file_id));
+
+    pub fn file_path(&self, path: &Path) -> PathBuf {
+        let mut path_buf = path.to_path_buf();
+        path_buf.push(log_file_path(self.file_id()));
         path_buf
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LogEntryHeader {
     crc: CRC,
     timestamp: u64,
@@ -135,7 +325,7 @@ impl LogEntryHeader {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LogEntry {
     header: LogEntryHeader,
     key: Vec<u8>,
@@ -247,6 +437,16 @@ impl LogEntry {
     pub fn size(&self) -> usize {
         HEADER_SIZE + self.key.len() + self.value.len()
     }
+
+    pub fn tombstone(&mut self) {
+        self.header.value_len = 0;
+        self.value.clear();
+        self.header.timestamp = current_timestamp();
+    }
+
+    pub fn is_tombstone(&self) -> bool {
+        self.value.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -306,14 +506,14 @@ impl From<std::io::Error> for StorageError {
 #[derive(Debug)]
 pub struct LogReader {
     path: PathBuf,
-    current_file: Option<std::fs::File>,
+    current_file: Option<RefCell<std::fs::File>>,
 }
 
 impl LogReader {
     pub fn new(path: &Path) -> Result<Self, StorageError> {
         Ok(LogReader {
             path: path.to_path_buf(),
-            current_file: Some(Self::open_read_only_file(path)?),
+            current_file: Some(RefCell::new(Self::open_read_only_file(path)?)),
         })
     }
 
@@ -321,9 +521,10 @@ impl LogReader {
         Ok(OpenOptions::new().read(true).open(path)?)
     }
 
-    pub fn read_at(&mut self, offset: Offset, size: Size) -> Result<LogEntry, StorageError> {
-        match &mut self.current_file {
+    pub fn read_at(&self, offset: Offset, size: Size) -> Result<LogEntry, StorageError> {
+        match &self.current_file {
             Some(file) => {
+                let mut file = file.borrow_mut();
                 file.seek(SeekFrom::Start(offset))?;
                 let mut buffer = vec![0u8; size as usize];
                 file.read_exact(&mut buffer)?;
@@ -347,7 +548,7 @@ pub struct LogReaderIterator {
 }
 
 impl Iterator for LogReaderIterator {
-    type Item = Result<LogEntry, StorageError>;
+    type Item = LogEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
         #[cfg(feature = "bincode")]
@@ -361,13 +562,12 @@ impl Iterator for LogReaderIterator {
             let header = LogEntryHeader::from_bytes(&buffer).ok()?;
             let mut buffer = vec![0u8; (header.key_len + header.value_len) as usize];
             self.file.read_exact(&mut buffer).ok()?;
-
-            Some(LogEntry::deserialize_with_header(header, &buffer))
+            let entry = LogEntry::deserialize_with_header(header, &buffer).ok()?;
+            Some(entry)
         }
     }
 }
 
-pub type Offset = u64;
 pub type Size = u64;
 
 #[derive(Debug)]
@@ -401,6 +601,18 @@ where
 {
     fn drop(&mut self) {
         let _ = self.flush();
+    }
+}
+
+pub struct BitcaskOptions {
+    size: Size,
+}
+
+impl Default for BitcaskOptions {
+    fn default() -> Self {
+        Self {
+            size: ROTATION_FILE_SIZE,
+        }
     }
 }
 
@@ -451,13 +663,13 @@ where
 
     fn reset_buffer(&mut self) {
         self.buffer = T::default();
-        self.offset = 0;
     }
 
     fn write_to_buffer(&mut self, bytes: &[u8]) -> Result<u64, StorageError> {
         self.buffer.write_all(&bytes)?;
         let offset = self.offset;
         self.offset += bytes.len() as Size;
+
         Ok(offset)
     }
 
@@ -488,6 +700,7 @@ where
         new_file_path.push(log_file_path(new_file_id));
 
         self.current_file = new_file_path;
+        self.offset = 0;
 
         Ok(())
     }
@@ -501,6 +714,8 @@ where
             self.rotate()?;
         }
         let bytes = entry.serialize()?;
+
+        // BUG: if the writer is flushed before this will return an offset of 0 as the offset is in the buffer
         let offset = self.write_to_buffer(&bytes)?;
         Ok((offset, bytes.len() as Size))
     }
