@@ -11,6 +11,7 @@ use std::{
     fmt::Display,
     fs::{DirEntry, OpenOptions},
     io::{Error, ErrorKind, Read, Seek, SeekFrom, Write},
+    ops::Deref,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -35,21 +36,14 @@ pub struct Bitcask {
 impl Bitcask {
     pub fn open_with_options(path: &Path, options: BitcaskOptions) -> Result<Self, StorageError> {
         info!("Opening Bitcask at {:?} with options {:?}", path, options);
-        Ok(if Self::has_log_files(path)? {
-            let (writer, memory_index) = Self::restore(path)?;
-            Bitcask {
-                path: path.to_path_buf(),
-                writer: RefCell::new(writer),
-                readers: RefCell::new(HashMap::new()),
-                memory_index: RefCell::new(memory_index),
-            }
-        } else {
-            Bitcask {
-                path: path.to_path_buf(),
-                writer: RefCell::new(MemoryLogWriter::with_options(path, options.size)?),
-                readers: RefCell::new(HashMap::new()),
-                memory_index: RefCell::new(MemIndex::new()),
-            }
+
+        let (writer, memory_index) = Self::restore(path, &options)?;
+
+        Ok(Bitcask {
+            path: path.to_path_buf(),
+            writer: RefCell::new(writer),
+            readers: RefCell::new(HashMap::new()),
+            memory_index: RefCell::new(memory_index),
         })
     }
 
@@ -117,24 +111,13 @@ impl Bitcask {
         self.writer.borrow_mut().sync()
     }
 
-    fn has_log_files(path: &Path) -> Result<bool, StorageError> {
-        // Check if any .log files exist
-        for entry in std::fs::read_dir(path)? {
-            if let Ok(entry) = entry {
-                if entry.path().extension() == Some("log".as_ref()) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
     fn rebuild(
         path: &Path,
         memory_map: HashMap<Vec<u8>, LogEntry>,
+        options: &BitcaskOptions,
     ) -> Result<(MemoryLogWriter, MemIndex), StorageError> {
         debug!("Rebuilding path {:?}", path);
-        let mut writer = MemoryLogWriter::with_options(path, ROTATION_FILE_SIZE)?;
+        let mut writer = MemoryLogWriter::with_options(path, options.size)?;
         let mut memory_index = MemIndex::new();
         for (key, entry) in memory_map {
             let offset = writer.append(&entry)?;
@@ -173,38 +156,46 @@ impl Bitcask {
         Ok(())
     }
 
-    fn restore(path: &Path) -> Result<(MemoryLogWriter, MemIndex), StorageError> {
+    fn restore(
+        path: &Path,
+        options: &BitcaskOptions,
+    ) -> Result<(MemoryLogWriter, MemIndex), StorageError> {
         info!("Restoring at path {:?}", path);
-        let mut memory_map = HashMap::<Vec<u8>, LogEntry>::new();
-        let log_files: Vec<_> = std::fs::read_dir(path)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension() == Some("log".as_ref()))
-            .collect();
+        Ok(if has_log_files(path)? {
+            let mut memory_map = HashMap::<Vec<u8>, LogEntry>::new();
+            let log_files: Vec<DirEntry> = log_files(path)?;
 
-        for log_file in &log_files {
-            let reader = LogReader::new(&log_file.path())?;
+            for log_file in &log_files {
+                let reader = LogReader::new(&log_file.path())?;
 
-            for entry in reader.iter()? {
-                if entry.is_tombstone() {
-                    debug!("Removing tombstone {:?}", entry.key());
-                    memory_map.remove(entry.key());
-                } else {
-                    memory_map.insert(entry.key().to_vec(), entry.clone());
+                for LogEntryItem { entry, .. } in reader.iter()? {
+                    if entry.is_tombstone() {
+                        debug!("Removing tombstone {:?}", entry.key());
+                        memory_map.remove(entry.key());
+                    } else {
+                        memory_map.insert(entry.key().to_vec(), entry.clone());
+                    }
                 }
             }
-        }
 
-        let compact_directory = path.join(".compacting");
-        std::fs::create_dir_all(&compact_directory)?;
-        let (mut writer, memory_index) = Self::rebuild(&compact_directory, memory_map)?;
-        Self::clear_all_files(&log_files)?;
-        Self::move_files(&compact_directory, path)?;
-        writer.move_path(path);
-        Ok((writer, memory_index))
+            let compact_directory = path.join(".compacting");
+            std::fs::create_dir_all(&compact_directory)?;
+            let (mut writer, memory_index) =
+                Self::rebuild(&compact_directory, memory_map, options)?;
+            Self::clear_all_files(&log_files)?;
+            Self::move_files(&compact_directory, path)?;
+            writer.move_path(path);
+            (writer, memory_index)
+        } else {
+            (
+                MemoryLogWriter::with_options(path, options.size)?,
+                MemIndex::new(),
+            )
+        })
     }
 
     pub fn compact(&mut self) -> Result<(), StorageError> {
-        let _ = Self::restore(&self.path);
+        let _ = Self::restore(&self.path, &BitcaskOptions::default());
         Ok(())
     }
 }
@@ -260,8 +251,61 @@ impl MemIndex {
     }
 }
 
+fn has_log_files(path: &Path) -> Result<bool, StorageError> {
+    // Check if any .log files exist
+    for entry in std::fs::read_dir(path)? {
+        if let Ok(entry) = entry {
+            if entry.path().extension() == Some("log".as_ref()) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn log_files(path: &Path) -> Result<Vec<DirEntry>, StorageError> {
+    Ok(std::fs::read_dir(path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension() == Some("log".as_ref()))
+        .collect())
+}
+
+fn latest_log_file(path: &Path) -> Result<FileID, StorageError> {
+    let log_files = log_files(path)?;
+    let mut latest_file_id = 0;
+    for log_file in log_files {
+        let file_id = file_id_from_path(&log_file.path())?;
+        if file_id > latest_file_id {
+            latest_file_id = file_id;
+        }
+    }
+    Ok(latest_file_id)
+}
+
 fn log_file_path(file_id: FileID) -> String {
     format!("{file_id:06}.log")
+}
+
+fn file_id_from_path(path: &Path) -> Result<FileID, StorageError> {
+    let file_id = path
+        .to_path_buf()
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Could not extract filename",
+            ))
+        })?
+        .parse::<u32>()
+        .map_err(|e| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid file ID: {}", e),
+            ))
+        })?;
+
+    Ok(file_id)
 }
 
 type Offset = u64;
@@ -558,8 +602,21 @@ pub struct LogReaderIterator {
     file: std::fs::File,
 }
 
+pub struct LogEntryItem {
+    pub entry: LogEntry,
+    pub position: u64,
+}
+
+impl Deref for LogEntryItem {
+    type Target = LogEntry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entry
+    }
+}
+
 impl Iterator for LogReaderIterator {
-    type Item = LogEntry;
+    type Item = LogEntryItem;
 
     fn next(&mut self) -> Option<Self::Item> {
         #[cfg(feature = "bincode")]
@@ -569,12 +626,13 @@ impl Iterator for LogReaderIterator {
         #[cfg(not(feature = "bincode"))]
         {
             let mut buffer = [0u8; HEADER_SIZE];
+            let position = self.file.stream_position().ok()?;
             self.file.read_exact(&mut buffer).ok()?;
             let header = LogEntryHeader::from_bytes(&buffer).ok()?;
             let mut buffer = vec![0u8; (header.key_len + header.value_len) as usize];
             self.file.read_exact(&mut buffer).ok()?;
             let entry = LogEntry::deserialize_with_header(header, &buffer).ok()?;
-            Some(entry)
+            Some(LogEntryItem { entry, position })
         }
     }
 }
@@ -617,7 +675,7 @@ where
 
 #[derive(Debug)]
 pub struct BitcaskOptions {
-    size: Size,
+    pub size: Size,
 }
 
 impl Default for BitcaskOptions {
@@ -637,7 +695,7 @@ where
     }
 
     pub fn with_options(path: &Path, size: Size) -> Result<Self, StorageError> {
-        let current_file_id = 0;
+        let current_file_id = latest_log_file(path)?;
         Self::initialise(
             &path.join(log_file_path(current_file_id)),
             Some(RotationConfig {
