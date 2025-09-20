@@ -12,6 +12,7 @@ use std::{
     fs::{DirEntry, OpenOptions},
     io::{Error, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -26,10 +27,22 @@ pub const ROTATION_FILE_SIZE: Size = 1024 * 1024;
 pub type MemoryLogWriter = LogWriter<Vec<u8>>;
 
 pub struct Bitcask {
+    inner: Arc<BitcaskInner>,
+}
+
+impl Clone for Bitcask {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+pub struct BitcaskInner {
     path: PathBuf,
-    writer: RefCell<MemoryLogWriter>,
-    readers: RefCell<HashMap<FileID, LogReader>>,
-    memory_index: RefCell<MemIndex>,
+    writer: Mutex<MemoryLogWriter>,
+    readers: Mutex<HashMap<FileID, LogReader>>,
+    memory_index: RwLock<MemIndex>,
 }
 
 impl Bitcask {
@@ -37,18 +50,22 @@ impl Bitcask {
         info!("Opening Bitcask at {:?} with options {:?}", path, options);
         Ok(if Self::has_log_files(path)? {
             let (writer, memory_index) = Self::restore(path)?;
-            Bitcask {
-                path: path.to_path_buf(),
-                writer: RefCell::new(writer),
-                readers: RefCell::new(HashMap::new()),
-                memory_index: RefCell::new(memory_index),
+            Self {
+                inner: Arc::new(BitcaskInner {
+                    path: path.to_path_buf(),
+                    writer: Mutex::new(writer),
+                    readers: Mutex::new(HashMap::new()),
+                    memory_index: RwLock::new(memory_index),
+                }),
             }
         } else {
-            Bitcask {
-                path: path.to_path_buf(),
-                writer: RefCell::new(MemoryLogWriter::with_options(path, options.size)?),
-                readers: RefCell::new(HashMap::new()),
-                memory_index: RefCell::new(MemIndex::new()),
+            Self {
+                inner: Arc::new(BitcaskInner {
+                    path: path.to_path_buf(),
+                    writer: Mutex::new(MemoryLogWriter::with_options(path, options.size)?),
+                    readers: Mutex::new(HashMap::new()),
+                    memory_index: RwLock::new(MemIndex::new()),
+                }),
             }
         })
     }
@@ -61,7 +78,7 @@ impl Bitcask {
         let timestamp = current_timestamp();
 
         let entry = LogEntry::new(key, value, timestamp);
-        let mut writer = self.writer.borrow_mut();
+        let mut writer = self.inner.writer.lock().unwrap();
         let offset = writer.append(&entry)?;
 
         let pointer = LogPointer::new(
@@ -70,24 +87,35 @@ impl Bitcask {
             entry.size() as u64,
             timestamp,
         );
-        self.memory_index.borrow_mut().insert(key.to_vec(), pointer);
+
+        self.inner
+            .memory_index
+            .write()
+            .unwrap()
+            .insert(key.to_vec(), pointer);
 
         Ok(())
     }
 
     fn get_entry(&self, pointer: &LogPointer) -> Result<LogEntry, StorageError> {
-        self.writer.borrow_mut().flush()?;
-        match self.readers.borrow_mut().entry(pointer.file_id()) {
+        self.inner.writer.lock().unwrap().flush()?;
+        let mut readers = self.inner.readers.lock().unwrap();
+        let reader = match readers.entry(pointer.file_id()) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(LogReader::new(&pointer.file_path(&self.path))?),
-        }
-        .read_at(pointer.offset(), pointer.size())
+            Entry::Vacant(e) => e.insert(LogReader::new(&pointer.file_path(&self.inner.path))?),
+        };
+        reader.read_at(pointer.offset(), pointer.size())
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(match self.memory_index.borrow().get(key) {
+        let pointer = {
+            let index = self.inner.memory_index.read().unwrap();
+            index.get(key).cloned()
+        };
+
+        Ok(match pointer {
             Some(pointer) => {
-                let entry = self.get_entry(pointer)?;
+                let entry = self.get_entry(&pointer)?;
                 Some(entry.value().to_vec())
             }
             None => None,
@@ -95,14 +123,24 @@ impl Bitcask {
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        let mut memory_index = self.memory_index.borrow_mut();
-        Ok(match memory_index.get(key) {
+        // First, check if the key exists and get the pointer
+        let pointer = {
+            let index = self.inner.memory_index.read().unwrap();
+            index.get(key).cloned()
+        };
+
+        Ok(match pointer {
             Some(pointer) => {
-                let mut entry = self.get_entry(pointer)?;
+                // Get the entry (this acquires writer and readers locks)
+                let mut entry = self.get_entry(&pointer)?;
                 let value = entry.value.clone();
                 entry.tombstone();
-                self.writer.borrow_mut().append(&entry)?;
-                memory_index.delete(key);
+
+                // Write the tombstone
+                self.inner.writer.lock().unwrap().append(&entry)?;
+
+                // Finally, remove from index
+                self.inner.memory_index.write().unwrap().delete(key);
                 Some(value)
             }
             None => None,
@@ -110,7 +148,7 @@ impl Bitcask {
     }
 
     pub fn sync(&self) -> Result<(), StorageError> {
-        self.writer.borrow_mut().sync()
+        self.inner.writer.lock().unwrap().sync()
     }
 
     fn has_log_files(path: &Path) -> Result<bool, StorageError> {
@@ -200,7 +238,7 @@ impl Bitcask {
     }
 
     pub fn compact(&mut self) -> Result<(), StorageError> {
-        let _ = Self::restore(&self.path);
+        let _ = Self::restore(&self.inner.path);
         Ok(())
     }
 }
