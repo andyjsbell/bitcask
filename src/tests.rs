@@ -1,4 +1,6 @@
-use crate::bitcask::{Bitcask, LogEntry, LogPointer, LogReader, LogWriter, MemIndex, StorageError};
+use crate::bitcask::{
+    Bitcask, BitcaskOptions, LogEntry, LogPointer, LogReader, LogWriter, MemIndex, StorageError,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
@@ -2040,304 +2042,309 @@ mod persistence_tests {
     }
 }
 
-// // ============================================
-// // Crash Recovery Tests
-// // ============================================
+// ============================================
+// Crash Recovery Tests
+// ============================================
 
-// #[cfg(test)]
-// mod crash_recovery_tests {
-//     use super::*;
-//     use bitcask::{LogWriter, LogEntry, LogPointer};
+#[cfg(test)]
+mod crash_recovery_tests {
+    use crate::bitcask::MemoryLogWriter;
 
-//     #[test]
-//     fn test_bitcask_recovery_from_clean_shutdown() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let db_path = temp_dir.path().to_path_buf();
+    use super::*;
 
-//         // Create database with data
-//         {
-//             let mut db = Bitcask::open(&db_path).unwrap();
-//             for i in 0..10 {
-//                 let key = format!("key{}", i);
-//                 let value = format!("value{}", i);
-//                 db.put(key.as_bytes(), value.as_bytes()).unwrap();
-//             }
-//             db.sync().unwrap();
-//         }
+    #[test]
+    fn test_bitcask_recovery_from_clean_shutdown() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
 
-//         // Reopen - should rebuild index from log
-//         {
-//             let db = Bitcask::open(&db_path).unwrap();
+        // Create database with data
+        {
+            let mut db = Bitcask::open(&db_path).unwrap();
+            for i in 0..10 {
+                let key = format!("key{}", i);
+                let value = format!("value{}", i);
+                db.put(key.as_bytes(), value.as_bytes()).unwrap();
+            }
+            db.sync().unwrap();
+        }
 
-//             // All data should be accessible
-//             for i in 0..10 {
-//                 let key = format!("key{}", i);
-//                 let value = format!("value{}", i);
-//                 assert_eq!(db.get(key.as_bytes()).unwrap(), Some(value.into_bytes()));
-//             }
-//         }
-//     }
+        // Reopen - should rebuild index from log
+        {
+            let db = Bitcask::open(&db_path).unwrap();
 
-//     #[test]
-//     fn test_bitcask_recovery_with_updates() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let db_path = temp_dir.path().to_path_buf();
+            // All data should be accessible
+            for i in 0..10 {
+                let key = format!("key{}", i);
+                let value = format!("value{}", i);
+                assert_eq!(db.get(key.as_bytes()).unwrap(), Some(value.into_bytes()));
+            }
+        }
+    }
 
-//         // Create log with updates (same key multiple times)
-//         {
-//             let mut db = Bitcask::open(&db_path).unwrap();
+    #[test]
+    fn test_bitcask_recovery_with_updates() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
 
-//             // Write initial values
-//             for i in 0..5 {
-//                 let key = format!("key{}", i);
-//                 db.put(key.as_bytes(), b"initial").unwrap();
-//             }
+        // Create log with updates (same key multiple times)
+        {
+            let mut db = Bitcask::open(&db_path).unwrap();
 
-//             // Update some values
-//             for i in 0..3 {
-//                 let key = format!("key{}", i);
-//                 db.put(key.as_bytes(), b"updated").unwrap();
-//             }
+            // Write initial values
+            for i in 0..5 {
+                let key = format!("key{}", i);
+                db.put(key.as_bytes(), b"initial").unwrap();
+            }
 
-//             db.sync().unwrap();
-//         }
+            // Update some values
+            for i in 0..3 {
+                let key = format!("key{}", i);
+                db.put(key.as_bytes(), b"updated").unwrap();
+            }
 
-//         // Reopen and verify latest values are used
-//         {
-//             let db = Bitcask::open(&db_path).unwrap();
+            db.sync().unwrap();
+        }
 
-//             // First 3 should be updated
-//             for i in 0..3 {
-//                 let key = format!("key{}", i);
-//                 assert_eq!(db.get(key.as_bytes()).unwrap(), Some(b"updated".to_vec()));
-//             }
+        // Reopen and verify latest values are used
+        {
+            let db = Bitcask::open(&db_path).unwrap();
 
-//             // Last 2 should be initial
-//             for i in 3..5 {
-//                 let key = format!("key{}", i);
-//                 assert_eq!(db.get(key.as_bytes()).unwrap(), Some(b"initial".to_vec()));
-//             }
-//         }
-//     }
+            // First 3 should be updated
+            for i in 0..3 {
+                let key = format!("key{}", i);
+                assert_eq!(db.get(key.as_bytes()).unwrap(), Some(b"updated".to_vec()));
+            }
 
-//     #[test]
-//     fn test_bitcask_recovery_with_deletes() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let db_path = temp_dir.path().to_path_buf();
+            // Last 2 should be initial
+            for i in 3..5 {
+                let key = format!("key{}", i);
+                assert_eq!(db.get(key.as_bytes()).unwrap(), Some(b"initial".to_vec()));
+            }
+        }
+    }
 
-//         // Create log with deletes
-//         {
-//             let mut db = Bitcask::open(&db_path).unwrap();
+    #[test]
+    fn test_bitcask_recovery_with_deletes() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
 
-//             // Write values
-//             db.put(b"keep", b"value").unwrap();
-//             db.put(b"delete", b"value").unwrap();
+        // Create log with deletes
+        {
+            let mut db = Bitcask::open(&db_path).unwrap();
 
-//             // Delete one
-//             db.delete(b"delete").unwrap();
+            // Write values
+            db.put(b"keep", b"value").unwrap();
+            db.put(b"delete", b"value").unwrap();
 
-//             db.sync().unwrap();
-//         }
+            // Delete one
+            db.delete(b"delete").unwrap();
 
-//         // Reopen and verify delete was recovered
-//         {
-//             let db = Bitcask::open(&db_path).unwrap();
+            db.sync().unwrap();
+        }
 
-//             assert_eq!(db.get(b"keep").unwrap(), Some(b"value".to_vec()));
-//             assert_eq!(db.get(b"delete").unwrap(), None);
-//         }
-//     }
+        // Reopen and verify delete was recovered
+        {
+            let db = Bitcask::open(&db_path).unwrap();
+            println!("reopened and reading for key keep");
+            assert_eq!(db.get(b"keep").unwrap(), Some(b"value".to_vec()));
+            assert_eq!(db.get(b"delete").unwrap(), None);
+        }
+    }
 
-//     #[test]
-//     fn test_bitcask_recovery_from_partial_write() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let db_path = temp_dir.path().to_path_buf();
-//         let log_path = db_path.join("000000.log");
+    #[test]
+    fn test_bitcask_recovery_from_partial_write() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
+        let log_path = db_path.join("000000.log");
 
-//         // Create valid entries
-//         {
-//             let mut db = Bitcask::open(&db_path).unwrap();
-//             db.put(b"complete1", b"value1").unwrap();
-//             db.put(b"complete2", b"value2").unwrap();
-//             db.sync().unwrap();
-//         }
+        // Create valid entries
+        {
+            let mut db = Bitcask::open(&db_path).unwrap();
+            db.put(b"complete1", b"value1").unwrap();
+            db.put(b"complete2", b"value2").unwrap();
+            db.sync().unwrap();
+        }
 
-//         // Simulate partial write (corruption at end of file)
-//         {
-//             let mut partial_entry = LogEntry::new(b"partial", b"corrupted", 1699564800);
-//             partial_entry.calculate_crc();
-//             let serialized = partial_entry.serialize().unwrap();
+        // Simulate partial write (corruption at end of file)
+        {
+            let mut partial_entry = LogEntry::new(b"partial", b"corrupted", 1699564800);
+            partial_entry.calculate_crc();
+            let serialized = partial_entry.serialize().unwrap();
 
-//             // Append only half of the entry (simulating crash during write)
-//             use std::fs::OpenOptions;
-//             use std::io::Write;
-//             let mut file = OpenOptions::new()
-//                 .append(true)
-//                 .open(&log_path)
-//                 .unwrap();
-//             file.write_all(&serialized[..serialized.len() / 2]).unwrap();
-//         }
+            // Append only half of the entry (simulating crash during write)
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            let mut file = OpenOptions::new().append(true).open(&log_path).unwrap();
+            file.write_all(&serialized[..serialized.len() / 2]).unwrap();
+        }
 
-//         // Reopen - should recover gracefully
-//         {
-//             let db = Bitcask::open(&db_path).unwrap();
+        // Reopen - should recover gracefully
+        {
+            let db = Bitcask::open(&db_path).unwrap();
 
-//             // Complete entries should be recovered
-//             assert_eq!(db.get(b"complete1").unwrap(), Some(b"value1".to_vec()));
-//             assert_eq!(db.get(b"complete2").unwrap(), Some(b"value2".to_vec()));
+            // Complete entries should be recovered
+            assert_eq!(db.get(b"complete1").unwrap(), Some(b"value1".to_vec()));
+            assert_eq!(db.get(b"complete2").unwrap(), Some(b"value2".to_vec()));
 
-//             // Partial entry should not exist
-//             assert_eq!(db.get(b"partial").unwrap(), None);
-//         }
-//     }
+            // Partial entry should not exist
+            assert_eq!(db.get(b"partial").unwrap(), None);
+        }
+    }
 
-//     #[test]
-//     fn test_bitcask_recovery_from_corrupted_entry() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let db_path = temp_dir.path().to_path_buf();
+    #[test]
+    fn test_bitcask_recovery_from_corrupted_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
 
-//         // Create some valid entries
-//         {
-//             let mut db = Bitcask::open(&db_path).unwrap();
-//             db.put(b"before", b"value").unwrap();
-//             db.sync().unwrap();
-//         }
+        // Create some valid entries
+        {
+            let mut db = Bitcask::open(&db_path).unwrap();
+            db.put(b"before", b"value").unwrap();
+            db.sync().unwrap();
+        }
 
-//         // Manually corrupt an entry in the middle
-//         {
-//             let log_path = db_path.join("000000.log");
-//             let mut data = fs::read(&log_path).unwrap();
+        // Manually corrupt an entry in the middle
+        {
+            let log_path = db_path.join("000000.log");
+            let mut data = fs::read(&log_path).unwrap();
 
-//             // Flip some bits in the middle
-//             if data.len() > 20 {
-//                 data[15] ^= 0xFF;
-//                 data[16] ^= 0xFF;
-//             }
+            // Flip some bits in the middle
+            if data.len() > 20 {
+                data[15] ^= 0xFF;
+                data[16] ^= 0xFF;
+            }
 
-//             fs::write(&log_path, data).unwrap();
-//         }
+            fs::write(&log_path, data).unwrap();
+        }
 
-//         // Write more valid data after corruption
-//         {
-//             let mut writer = LogWriter::new(&db_path.join("000000.log")).unwrap();
-//             let mut entry = LogEntry::new(b"after", b"value", 1699564900);
-//             entry.calculate_crc();
-//             writer.append(&entry).unwrap();
-//             writer.sync().unwrap();
-//         }
+        // Write more valid data after corruption
+        {
+            let mut writer = MemoryLogWriter::new(&db_path.join("000000.log")).unwrap();
+            let mut entry = LogEntry::new(b"after", b"value", 1699564900);
+            entry.calculate_crc();
+            writer.append(&entry).unwrap();
+            writer.sync().unwrap();
+        }
 
-//         // Reopen - should handle corruption gracefully
-//         {
-//             let result = Bitcask::open(&db_path);
+        // Reopen - should handle corruption gracefully
+        {
+            let result = Bitcask::open(&db_path);
 
-//             // Depending on implementation, might:
-//             // 1. Skip corrupted entry and continue
-//             // 2. Stop at corruption point
-//             // 3. Fail to open
+            // Depending on implementation, might:
+            // 1. Skip corrupted entry and continue
+            // 2. Stop at corruption point
+            // 3. Fail to open
 
-//             // Document your choice with assertions
-//             if let Ok(db) = result {
-//                 // If it opens, check what was recovered
-//                 let before = db.get(b"before").unwrap();
-//                 let after = db.get(b"after").unwrap();
+            // Document your choice with assertions
+            if let Ok(db) = result {
+                // If it opens, check what was recovered
+                let before = db.get(b"before").unwrap();
+                let after = db.get(b"after").unwrap();
 
-//                 println!("Recovery behavior: before={:?}, after={:?}", before, after);
-//             } else {
-//                 println!("Database failed to open with corruption");
-//             }
-//         }
-//     }
+                println!("Recovery behavior: before={:?}, after={:?}", before, after);
+            } else {
+                println!("Database failed to open with corruption");
+            }
+        }
+    }
 
-//     #[test]
-//     fn test_bitcask_recovery_multiple_log_files() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let db_path = temp_dir.path().to_path_buf();
+    #[test]
+    fn test_bitcask_recovery_multiple_log_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
 
-//         // Create multiple log files with rotation
-//         {
-//             // Use with_options for rotation
-//             let mut db = Bitcask::with_options(&db_path, 500).unwrap(); // Small size to force rotation
+        // Create multiple log files with rotation
+        {
+            // Use with_options for rotation
+            let db = Bitcask::open_with_options(&db_path, BitcaskOptions { size: 500 }).unwrap(); // Small size to force rotation
 
-//             // Write enough data to span multiple files
-//             for i in 0..20 {
-//                 let key = format!("key{:02}", i);
-//                 let value = vec![0xFF; 50]; // Each entry ~70 bytes with overhead
-//                 db.put(key.as_bytes(), &value).unwrap();
-//             }
+            // Write enough data to span multiple files
+            for i in 0..20 {
+                let key = format!("key{:02}", i);
+                let value = vec![0xFF; 50]; // Each entry ~70 bytes with overhead
+                db.put(key.as_bytes(), &value).unwrap();
+            }
 
-//             db.sync().unwrap();
-//         }
+            db.sync().unwrap();
+        }
 
-//         // Verify multiple log files exist
-//         let log_files: Vec<_> = fs::read_dir(&db_path)
-//             .unwrap()
-//             .filter_map(|e| e.ok())
-//             .filter(|e| e.path().extension() == Some("log".as_ref()))
-//             .collect();
+        // Verify multiple log files exist
+        let log_files: Vec<_> = fs::read_dir(&db_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension() == Some("log".as_ref()))
+            .collect();
 
-//         assert!(log_files.len() > 1, "Should have multiple log files");
+        assert!(log_files.len() > 1, "Should have multiple log files");
 
-//         // Reopen - should scan all log files
-//         {
-//             let db = Bitcask::open(&db_path).unwrap();
+        // Reopen - should scan all log files
+        {
+            let db = Bitcask::open(&db_path).unwrap();
 
-//             // All keys should be accessible
-//             for i in 0..20 {
-//                 let key = format!("key{:02}", i);
-//                 assert!(db.get(key.as_bytes()).unwrap().is_some(),
-//                     "Key {} should exist after recovery", key);
-//             }
-//         }
-//     }
+            // All keys should be accessible
+            for i in 0..20 {
+                let key = format!("key{:02}", i);
+                assert!(
+                    db.get(key.as_bytes()).unwrap().is_some(),
+                    "Key {} should exist after recovery",
+                    key
+                );
+            }
+        }
+    }
 
-//     #[test]
-//     fn test_bitcask_recovery_preserves_file_id() {
-//         let temp_dir = TempDir::new().unwrap();
-//         let db_path = temp_dir.path().to_path_buf();
+    #[test]
+    fn test_bitcask_recovery_preserves_file_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().to_path_buf();
 
-//         // Create database with rotation
-//         {
-//             let mut db = Bitcask::with_options(&db_path, 500).unwrap();
+        // Create database with rotation
+        {
+            let db = Bitcask::open_with_options(&db_path, BitcaskOptions { size: 500 }).unwrap();
 
-//             // Force multiple files
-//             for i in 0..30 {
-//                 let value = vec![0xAB; 40];
-//                 db.put(format!("key{}", i).as_bytes(), &value).unwrap();
-//             }
+            // Force multiple files
+            for i in 0..30 {
+                let value = vec![0xAB; 40];
+                db.put(format!("key{}", i).as_bytes(), &value).unwrap();
+            }
 
-//             db.sync().unwrap();
-//         }
+            db.sync().unwrap();
+        }
 
-//         // Count log files before restart
-//         let files_before: Vec<_> = fs::read_dir(&db_path)
-//             .unwrap()
-//             .filter_map(|e| e.ok())
-//             .filter(|e| e.path().extension() == Some("log".as_ref()))
-//             .map(|e| e.path())
-//             .collect();
+        // Count log files before restart
+        let files_before: Vec<_> = fs::read_dir(&db_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension() == Some("log".as_ref()))
+            .map(|e| e.path())
+            .collect();
 
-//         let last_file_id_before = files_before.len() - 1;
+        let last_file_id_before = files_before.len() - 1;
 
-//         // Reopen
-//         {
-//             let mut db = Bitcask::with_options(&db_path, 500).unwrap();
+        // Reopen
+        {
+            let db = Bitcask::open_with_options(&db_path, BitcaskOptions { size: 500 }).unwrap();
 
-//             // Write more data
-//             db.put(b"after_recovery", b"value").unwrap();
-//             db.sync().unwrap();
-//         }
+            // Write more data
+            db.put(b"after_recovery", b"value").unwrap();
+            db.sync().unwrap();
+        }
 
-//         // Should continue from last file ID, not restart at 0
-//         let files_after: Vec<_> = fs::read_dir(&db_path)
-//             .unwrap()
-//             .filter_map(|e| e.ok())
-//             .filter(|e| e.path().extension() == Some("log".as_ref()))
-//             .collect();
+        // Should continue from last file ID, not restart at 0
+        let files_after: Vec<_> = fs::read_dir(&db_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension() == Some("log".as_ref()))
+            .collect();
 
-//         assert!(files_after.len() >= files_before.len(),
-//             "Should preserve or increment file count");
-//     }
-// }
+        println!("{} >= {}", files_after.len(), files_before.len());
+
+        assert!(
+            files_after.len() >= files_before.len(),
+            "Should preserve or increment file count"
+        );
+    }
+}
 
 // // ============================================
 // // Edge Cases and Error Handling
